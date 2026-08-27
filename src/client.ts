@@ -67,12 +67,10 @@ const SORT_DIRECTIONS = { asc: 1, desc: 2 } as const;
 
 /**
  * Size of every upload message this SDK emits, except the last one. This is the
- * server's per-message ceiling (server.rs `CHUNK_SIZE`); a larger message is
- * refused with `INVALID_ARGUMENT`, so sending exactly this much is the fewest
- * messages a file can take. Since `1.0.0-rc.16` the server reassembles a
- * download from the recorded `size_bytes` rather than a guessed chunk count, so
- * a smaller chunk size would also work — it would just cost more messages, and
- * it would be unsafe against a pre-`rc.16` server.
+ * server's per-message ceiling (server.rs `CHUNK_SIZE`); a larger message is refused with
+ * `INVALID_ARGUMENT`, so sending exactly this much is the fewest messages a file can take.
+ * It is also the only chunk size safe against a server older than `1.0.0-rc.16`, which
+ * reassembled a download from a guessed chunk count instead of the recorded `size_bytes`.
  */
 const UPLOAD_CHUNK_BYTES = 1_048_576; // 1 MiB
 /** Server default `limits.max_file_bytes`; checked client-side to fail fast. */
@@ -81,9 +79,7 @@ const MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
 const CHECKSUM_BYTES = 32;
 /**
  * Default connect deadline applied when {@link RociaDbBuilder.connectTimeout} is never
- * called and {@link RociaDbClientOptions.connectTimeoutMs} is omitted. Must stay in sync
- * with the Rust SDK's `Duration::from_secs(10)` default — the two SDKs are required to
- * agree on this value.
+ * called and {@link RociaDbClientOptions.connectTimeoutMs} is omitted.
  */
 export const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
@@ -574,12 +570,10 @@ export class RociaDbClient {
    * Source chunks may be of any size — the README's `createReadStream()` example emits
    * 64 KiB pieces, for instance — because this method re-buffers them internally and
    * only ever writes exactly {@link UPLOAD_CHUNK_BYTES} (1 MiB) per outgoing message
-   * (the last message carries the remainder). The server stores one chunk per
-   * non-empty message and, since `1.0.0-rc.16`, reads a download back by the
-   * recorded `size_bytes`, so this re-buffering is about sending the fewest
-   * possible messages — and about staying safe against a pre-`rc.16` server,
-   * which guessed the chunk count and silently truncated downloads from any
-   * client that emitted smaller messages.
+   * (the last message carries the remainder). The server stores one chunk per non-empty
+   * message, so this re-buffering sends the fewest possible messages, and the fixed
+   * 1 MiB size is the only one safe against a server older than `1.0.0-rc.16`, which
+   * guessed the chunk count instead of reading it back from the recorded `size_bytes`.
    */
   async uploadFileStream(
     file: FileStreamUpload,
@@ -884,12 +878,10 @@ export function computeOrValidateChecksum(bytes: Uint8Array, checksum?: Uint8Arr
 /**
  * Re-chunk an iterable of arbitrarily-sized byte pieces into messages of exactly
  * {@link UPLOAD_CHUNK_BYTES} (1 MiB) each, except the last message, which carries
- * whatever remains. 1 MiB is the server's per-message ceiling, so this is the
- * fewest messages a file can take; it is also the only chunking that stays safe
- * against a pre-`1.0.0-rc.16` server, which reassembled a download from a
- * guessed `ceil(size_bytes / 1 MiB)` chunk count and silently truncated anything
- * sent in smaller pieces. This is the pure transformation, split out so it can
- * be unit tested without a server or a gRPC call.
+ * whatever remains. 1 MiB is the server's per-message ceiling, so this is the fewest
+ * messages a file can take, and the only chunking safe against a server older than
+ * `1.0.0-rc.16`, which reassembled a download from a guessed chunk count and truncated
+ * anything sent in smaller pieces.
  *
  * Validates as it goes: throws before yielding a chunk that would push the running
  * total past `sizeBytes`, and throws once the source is exhausted if the total falls
@@ -962,13 +954,11 @@ export function requireStreamChecksum(checksum: Uint8Array | undefined): Buffer 
  * the first message carries the file's metadata (tenant/bucket/file id, size_bytes,
  * content_type, checksum, request_id) — the server only reads those fields off the first
  * message of the stream, so repeating them on every later message would be wasted
- * bandwidth and CPU and would diverge from what the Rust SDK puts on the wire for the
- * same upload.
+ * bandwidth and CPU.
  *
- * Pulled out of {@link RociaDbClient.uploadFileStream} as a pure function (no gRPC call,
- * no I/O) so the exact wire shape it produces can be unit tested directly. `checksum` and
- * `requestId` are passed in already validated/defaulted by the caller, matching what
- * `uploadFileStream` computes before opening the network call.
+ * Exported for unit testing the exact wire shape produced; used internally by
+ * {@link RociaDbClient.uploadFileStream}, which passes in `checksum` and `requestId`
+ * already validated/defaulted.
  */
 export async function* buildUploadStreamRequests(
   file: FileStreamUpload,
@@ -1008,8 +998,8 @@ export async function* buildUploadStreamRequests(
  * no re-chunking, no validation, and no first-message/later-message distinction; every
  * field travels exactly as the caller supplied it, for every message.
  *
- * Pulled out of {@link RociaDbClient.uploadFileRaw} as a pure function (no gRPC call, no
- * I/O) so the passthrough behavior can be unit tested directly.
+ * Exported for unit testing the passthrough behavior; used internally by
+ * {@link RociaDbClient.uploadFileRaw}.
  */
 export async function* buildRawUploadRequests(
   requests: AsyncIterable<RawUploadMessage> | Iterable<RawUploadMessage>,

@@ -50,9 +50,8 @@ test("rechunkToUploadSize: a single byte yields one short chunk", async () => {
 });
 
 test("rechunkToUploadSize: exactly 1 MiB from 64 KiB reads yields one full chunk", async () => {
-  // This is the regression scenario: 16 x 64 KiB reads of a 1 MiB file must be
-  // re-assembled into exactly one 1 MiB message, not read back and re-split as
-  // 64 KiB chunks (which is what silently truncated downloads before the fix).
+  // 16 x 64 KiB reads of a 1 MiB file must be re-assembled into exactly one 1 MiB
+  // message, not stay split into 64 KiB pieces.
   assert.deepEqual(await collectSizes(UPLOAD_CHUNK_BYTES, 65_536), [UPLOAD_CHUNK_BYTES]);
 });
 
@@ -281,8 +280,6 @@ test("endpointFromHost: a scheme with no default port (neither http nor https) i
 });
 
 test("DEFAULT_CONNECT_TIMEOUT_MS is 10 000 ms, matching the Rust SDK's Duration::from_secs(10) default", () => {
-  // The parity spec requires both SDKs to apply the same unconditional connect
-  // deadline when the caller never configures one; this locks the shared value.
   assert.equal(DEFAULT_CONNECT_TIMEOUT_MS, 10_000);
 });
 
@@ -456,14 +453,9 @@ test("buildRawUploadRequests: forwards every message field exactly as given, wit
 });
 
 /**
- * `RociaDbClient`'s constructor is `private` at the TypeScript level — only `connect()`/
- * `RociaDbBuilder.build()` are meant to produce one, and both dial the network. But the
- * constructor body itself does nothing but assign its two fields, so it is safe to call
- * directly (bypassing only the *compile-time* `private` check, not any real guard) to
- * unit test client methods that never touch `#services` — {@link
- * RociaDbClient.invalidateToken} and {@link RociaDbClient.refreshAuthToken} only ever
- * touch `#tokenManager}, so a fake token manager and a never-used `services` placeholder
- * are all that is needed, with no gRPC channel and no network involved.
+ * Bypasses the compile-time-only `private` on `RociaDbClient`'s constructor to build one
+ * without dialing the network. Safe here because the tested methods only ever touch
+ * `#tokenManager`, never `#services`.
  */
 type TokenManagerLike = { invalidate(): void; refreshNow(): Promise<void> };
 type TestableClientCtor = new (services: unknown, tokenManager?: TokenManagerLike) => RociaDbClient;

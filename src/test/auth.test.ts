@@ -171,8 +171,7 @@ test("TokenManager.refreshNow(): a failing refresh rejects without discarding th
 
 test(
   "TokenManager.metadata(): a refresh failure within the skew margin falls back to the " +
-    "still-valid cached token instead of failing the in-flight RPC (regression test for the " +
-    "old behavior, which propagated the error and discarded a token that was not actually expired)",
+    "still-valid cached token instead of failing the in-flight RPC",
   async () => {
     let calls = 0;
     const mockFetch: typeof fetch = async () => {

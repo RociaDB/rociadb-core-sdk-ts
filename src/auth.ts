@@ -18,11 +18,10 @@ export interface OAuthToken {
 type FetchLike = typeof fetch;
 
 /**
- * Fetch one OAuth2 client-credentials token. Exported standalone (mirrors Rust's
- * `auth::fetch_token`) for callers who want the raw token exchange without the caching
- * and background-refresh behavior of {@link TokenManager} — `new TokenManager(config)
- * .initialize()` already covers that in practice, so reach for this only when you need
- * the token exchange in isolation.
+ * Fetch one OAuth2 client-credentials token. Exported standalone for callers who want the
+ * raw token exchange without the caching and background-refresh behavior of
+ * {@link TokenManager} — `new TokenManager(config).initialize()` already covers that in
+ * practice, so reach for this only when you need the token exchange in isolation.
  */
 export async function fetchOAuthToken(
   config: ClientCredentials,
@@ -89,11 +88,9 @@ export class TokenManager {
       } catch (error) {
         // Only within the skew margin, not actually expired yet: a refresh hiccup here
         // must not fail the in-flight RPC when a still-valid cached token could serve it
-        // instead. Mirrors the Rust TokenManager, which only overwrites the cached
-        // header on success and otherwise keeps injecting the old (still valid) one
-        // until a refresh actually succeeds. A token that never fetched, or one that is
-        // genuinely past its expiry, has nothing usable to fall back to, so the error
-        // still propagates in that case.
+        // instead, so the cached header is only ever overwritten on success. A token that
+        // never fetched, or one that is genuinely past its expiry, has nothing usable to
+        // fall back to, so the error still propagates in that case.
         if (this.#authorization !== undefined && Date.now() < this.#expiresAt) {
           console.warn(
             `RociaDB auth token refresh failed; reusing the still-valid cached token: ${String(error)}`,
@@ -115,9 +112,7 @@ export class TokenManager {
    * Call this after catching a {@link RociaDbError} whose `reason` is `"unauthenticated"`
    * (or `code` is `grpc.status.UNAUTHENTICATED`), before retrying: the server treats that
    * status as a renewal signal. The cached token is replaced only on success — a failed
-   * refresh here throws without discarding whatever token is currently cached, exactly
-   * like Rust's `TokenManager::refresh_now`, which only swaps its cached header once a
-   * new one is confirmed.
+   * refresh here throws without discarding whatever token is currently cached.
    */
   async refreshNow(): Promise<void> {
     const token = await fetchOAuthToken(this.#config, this.#fetch);

@@ -89,11 +89,9 @@ export function unary<Request, Response>(
  * As soon as one call rejects, every other in-flight call is actively cancelled — not
  * merely prevented from being followed by new ones — via the `AbortSignal` passed to
  * `mapper`, which callers (see `RociaDbClient.putNodes`/`addEdges`/the neighbor-node
- * helpers) must thread down to {@link unary}. This mirrors the Rust SDK's
- * `try_for_each_concurrent`, which drops in-flight futures on the first error: retrying
- * is always safe because every write here carries an idempotency key, so cancelling
- * already-dispatched requests is a pure reduction in wasted server-side work, never a
- * correctness risk.
+ * helpers) must thread down to {@link unary}. Retrying is always safe because every
+ * write here carries an idempotency key, so cancelling already-dispatched requests is a
+ * pure reduction in wasted server-side work, never a correctness risk.
  */
 export async function mapConcurrent<Input, Output>(
   values: readonly Input[],

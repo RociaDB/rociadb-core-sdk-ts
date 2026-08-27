@@ -90,11 +90,10 @@ export interface FileMetadata {
 }
 
 /**
- * Controls an in-memory file upload. Chunking is fixed at 1 MiB and is not
- * configurable: that is the server's per-message ceiling, so it is the fewest
- * messages a file can be sent in, and it is also the only chunking that stays
- * safe against a pre-`1.0.0-rc.16` server, which reassembled downloads by a
- * guessed chunk count. The knob was dropped rather than kept as a footgun.
+ * Controls an in-memory file upload. Chunking is fixed at 1 MiB and is not configurable:
+ * that is the server's per-message ceiling, so it is the fewest messages a file can be
+ * sent in, and the only chunking safe against a server older than `1.0.0-rc.16`, which
+ * reassembled downloads by a guessed chunk count.
  *
  * If `checksum` is omitted, the SDK computes a SHA-256 digest of `bytes` automatically
  * (the server rejects any checksum whose length is not exactly 32 bytes). If supplied,
@@ -163,9 +162,7 @@ export interface RociaDbClientOptions {
 
 /**
  * Discriminates the failure kind of a {@link RociaDbError} without splitting it into a
- * class hierarchy (which would break existing `instanceof RociaDbError` checks). This is
- * the functional TypeScript equivalent of matching on Rust's `RociaDbError` enum variants
- * (`Status`, `Connection`, `Auth`, `Encode`, `Decode`, `Validation`).
+ * class hierarchy (which would break existing `instanceof RociaDbError` checks).
  */
 export type RociaDbErrorKind = "status" | "connection" | "auth" | "encode" | "decode" | "validation";
 

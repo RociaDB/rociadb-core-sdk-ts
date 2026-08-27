@@ -5,6 +5,24 @@ tenant gRPC services. It covers all 22 RPCs from the packaged protobuf and adds
 pagination helpers, JSON decoding, bounded batch operations, OAuth2 token
 management, and ergonomic file streaming.
 
+## Contents
+
+- [What the SDK Manages](#what-the-sdk-manages)
+- [Requirements and Installation](#requirements-and-installation)
+- [Connecting](#connecting)
+- [Authentication](#authentication)
+- [Pagination](#pagination)
+- [Documents](#documents)
+- [Graph](#graph)
+- [Files](#files)
+- [Tenants](#tenants)
+- [Idempotence and Retries](#idempotence-and-retries)
+- [Error Handling](#error-handling)
+- [Advanced: Raw Protobuf Access](#advanced-raw-protobuf-access)
+- [API Coverage](#api-coverage)
+- [Parity with the Rust SDK](#parity-with-the-rust-sdk)
+- [Development and Publication](#development-and-publication)
+
 ## What the SDK Manages
 
 RociaDB organizes data around four identifiers:
@@ -358,6 +376,20 @@ Use `findDocumentsByField` for one exact field lookup, `listDocuments` for an
 unfiltered collection, and `queryDocuments` for multiple filters and sorting:
 
 ```ts
+const bySku = await client.findDocumentsByField<Product>(
+  "tenant-1",
+  "products",
+  "sku",
+  "sku-123",
+);
+```
+
+`findDocumentsByField`'s `value` must encode to a JSON **scalar** — a string,
+number, boolean, or `null`. An object or array throws `INVALID_ARGUMENT`
+server-side; it uses the same exact-match index as `queryDocuments`'s `eq`
+operator.
+
+```ts
 let cursor: string | undefined;
 
 do {
@@ -386,11 +418,6 @@ indexable is rejected with `INVALID_ARGUMENT` rather than served by a full
 scan — pair a short `contains` term with an `eq` or `in` filter on another
 field. Cursors are opaque: pass `nextCursor` back unchanged. `totalCount` is
 a `bigint` so protobuf `uint64` values never lose precision.
-
-`findDocumentsByField`'s `value` must encode to a JSON **scalar** — a
-string, number, boolean, or `null`. An object or array throws
-`INVALID_ARGUMENT` server-side; it uses the same exact-match index as
-`queryDocuments`'s `eq` operator.
 
 `totalCount` is not uniformly cheap. `listDocuments`'s count is read from a
 counter maintained on every write, so it costs nothing extra. `queryDocuments`'s
@@ -433,8 +460,12 @@ await client.putNodes("tenant-1", "catalog", [
 array — and, like `putDocument`, is capped at the server's
 `limits.max_doc_bytes` (2 MiB by default).
 
-Batch helpers issue at most 10 requests concurrently. They are not atomic: if
-one item fails, earlier items may already have been stored.
+Batch helpers (`putNodes`, `addEdges`, and the neighbor-node helpers below)
+issue at most 10 requests concurrently. They are not atomic: if one item
+fails, earlier items may already have been stored, and every other
+already-dispatched call in the batch is cancelled rather than left to run to
+completion. Retry a failed batch by reusing the same `requestId` values —
+see [Idempotence and Retries](#idempotence-and-retries).
 
 ### Directed edges and neighbors
 
@@ -481,6 +512,10 @@ deleting an edge is not idempotent.
 `getIncomingNeighborNodes<T>` helpers follow every page and load each node's
 JSON payload with bounded concurrency.
 
+`addEdges(tenantId, graph, edges)` batches edge creation the same way
+`putNodes` batches nodes — see [Nodes and batches](#nodes-and-batches) for
+the concurrency and non-atomicity rules shared by every batch helper.
+
 ### Discovering graphs and nodes
 
 ```ts
@@ -518,13 +553,12 @@ call `uploadFile`.
   rejected outright with `INVALID_ARGUMENT`; anything at or under that cap
   is fine, sliced however the client likes. `uploadFile` and
   `uploadFileStream` (below) both still always emit exactly-1-MiB messages
-  (the last one may be shorter) — not because the server requires it, but
-  because 1 MiB is the largest message the server allows, so it is also the
-  fewest possible messages for a given file; this is also why neither
-  `FileUploadOptions` nor `FileStreamUpload` has a `chunkSize` option. See
-  [Migrating to 0.3.0](#migrating-to-030) for why a caller-chosen chunk size
-  used to be dangerous, and [Migrating to 0.6.0](#migrating-to-060) for why
-  it no longer is against a current server.
+  (the last one may be shorter): 1 MiB is the largest message the server
+  allows, so it is also the fewest possible messages for a given file, and
+  it remains the only chunk size safe against a server older than
+  `1.0.0-rc.16`, which reassembled a download from a guessed chunk count
+  instead of the recorded `sizeBytes`. This is also why neither
+  `FileUploadOptions` nor `FileStreamUpload` exposes a `chunkSize` option.
 - **`checksum` must be exactly 32 raw bytes — a SHA-256 digest.** Any other
   length, including empty, is rejected with `INVALID_ARGUMENT` before a
   single chunk is read. The server does not verify that the checksum
@@ -551,24 +585,6 @@ call `uploadFile`.
   fresh `requestId`) is always safe.
 - **`deleteFile` removes a whole file by prefix**, regardless of how many
   chunks it was stored in or what chunk size wrote them.
-
-Server `1.0.0-rc.16` changed the *download* side of this contract, which is
-why the bullets above no longer mention a fixed chunk size: **before
-`rc.16`, the server derived how many chunks to read back on download as
-`ceil(sizeBytes / 1 MiB)`, so any upload chunk size other than exactly 1 MiB
-made a later download silently return truncated or garbled data, with no
-error at all, at upload or download time.** That is why this SDK has always
-defaulted to exactly-1-MiB chunking in `uploadFile`/`uploadFileStream`, and
-why it still does: this chunking remains correct, and is still the most
-efficient choice, against `rc.16`, and it is the only chunking that stays
-safe against a pre-`rc.16` server. The same guessed-chunk-count assumption
-affected `Delete` before `rc.16` too (it stopped after the same assumed
-chunk count, leaving a tail of orphaned chunks behind for any file that had
-used a different chunk size); `Delete` removing by prefix, as described
-above, is also new as of `rc.16`. See
-[Migrating to 0.6.0](#migrating-to-060) for the full correction and
-[Migrating to 0.3.0](#migrating-to-030) for the historical bug this SDK
-originally shipped a fix for.
 
 ### Buffered files
 
@@ -650,13 +666,10 @@ because `uploadFileStream` re-buffers internally and only ever writes 1 MiB
 per outgoing message, per
 [The upload wire contract](#the-upload-wire-contract) above.
 
-**Naming trap when porting code between SDKs:** despite doing this
-re-chunking and validation, this method is not the raw, zero-validation
-escape hatch — that is `uploadFileRaw`, covered next. The Rust SDK's
-`upload_file_stream` *is* that raw escape hatch there; this method's
-counterpart on the Rust side is instead named `upload_file_chunked`. See
-[Parity with the Rust SDK](#parity-with-the-rust-sdk) for the full naming
-table before porting upload code between the two SDKs by name alone.
+Porting upload code from the Rust SDK by method name alone is unsafe here:
+`uploadFileStream`'s Rust counterpart is not the method whose name looks
+closest — see [Parity with the Rust SDK](#parity-with-the-rust-sdk) for the
+naming table before translating upload calls between the two SDKs.
 
 ### Raw streaming upload escape hatch
 
@@ -664,13 +677,7 @@ table before porting upload code between the two SDKs by name alone.
 exactly as given — **no re-chunking, no checksum validation, and no
 distinction between the first message and the rest.** You are fully
 responsible for the wire contract described in
-[The upload wire contract](#the-upload-wire-contract) above: the first
-`RawUploadMessage` must carry `tenantId`, `bucket`, `fileId`, the exact
-total `sizeBytes`, and a 32-byte SHA-256 `checksum`; every message's
-`chunk` must be at most 1 MiB, or the upload fails with
-`INVALID_ARGUMENT`; `sizeBytes` must equal the exact sum of every `chunk`
-sent; and the metadata fields on messages after the first are ignored by
-the server and may be left empty.
+[The upload wire contract](#the-upload-wire-contract) above.
 
 ```ts
 import { createHash, randomUUID } from "node:crypto";
@@ -696,14 +703,14 @@ async function* rawUpload(): AsyncGenerator<RawUploadMessage> {
 await client.uploadFileRaw(rawUpload());
 ```
 
-As of server `rc.16`, getting the chunk *size* wrong here fails fast with
-`INVALID_ARGUMENT` rather than silently corrupting a later download — but a
-wrong `sizeBytes` total, or a `checksum` that does not actually match the
-bytes (the server only checks its length, never its content), can still
-slip through as an upload that looks successful while carrying bad data.
-Prefer `uploadFile` or `uploadFileStream` above unless you specifically need
-to hand-build the message stream — for example to interleave upload
-messages with transport-level logic that neither assisted helper exposes.
+Getting the chunk *size* wrong here fails fast with `INVALID_ARGUMENT`
+rather than silently corrupting a later download — but a wrong `sizeBytes`
+total, or a `checksum` that does not actually match the bytes (the server
+only checks its length, never its content), can still slip through as an
+upload that looks successful while carrying bad data. Prefer `uploadFile`
+or `uploadFileStream` above unless you specifically need to hand-build the
+message stream — for example to interleave upload messages with
+transport-level logic that neither assisted helper exposes.
 
 ### Discovering buckets and files
 
@@ -934,139 +941,6 @@ point (this SDK only — the builder here is a thin wrapper with no
 capability of its own beyond `connectTimeoutMs`, `authClientCredentials`,
 and `disableAuth`, so duplicating a second entry point in Rust would add an
 API to maintain for zero new capability).
-
-## Migrating to 0.6.0
-
-0.6.0 brings this SDK to full capability parity with the Rust SDK — see
-[Parity with the Rust SDK](#parity-with-the-rust-sdk) above. **Every public
-method, type, and option that existed in 0.3.0 still exists, with the same
-signature and the same behavior — this release only adds.** Nothing is
-removed, nothing already-shipped becomes an error, and every new capability
-below is opt-in: existing call sites keep compiling and behaving exactly as
-before without touching them.
-
-**Documentation-only correction, no behavior change:** this README used to
-state that the server required upload chunks of exactly 1 MiB and that
-anything else silently corrupted a later download. That was accurate
-against every server up to `1.0.0-rc.15`, and is no longer accurate against
-`1.0.0-rc.16` and later — the server now reads a download back by
-`sizeBytes`, not by an assumed chunk count. This SDK's own chunking never
-needed to change (`uploadFile`/`uploadFileStream` already always emitted
-exactly-1-MiB chunks, which remains correct and is still the most efficient
-choice, and is still required for correctness against a pre-`rc.16` server)
-— only the documentation explaining *why* was wrong, and has been
-corrected. See [The upload wire contract](#the-upload-wire-contract) for
-the current rules and [Migrating to 0.3.0](#migrating-to-030) for the
-historical note.
-
-New capabilities added in 0.6.0, each documented where linked:
-
-- `RociaDbClient.refreshAuthToken()` — the eager counterpart to the existing
-  `invalidateToken()` — see
-  [Two ways to recover from `UNAUTHENTICATED`](#two-ways-to-recover-from-unauthenticated).
-- `RociaDbClient.uploadFileRaw()` and the `RawUploadMessage` type — the raw,
-  zero-validation escape hatch — see
-  [Raw streaming upload escape hatch](#raw-streaming-upload-escape-hatch).
-- `RociaDbError.kind: RociaDbErrorKind` — see
-  [Error Handling](#error-handling).
-- `fetchOAuthToken` and the `OAuthToken` type, now exported from the package
-  root — see [Auth Helpers](#auth-helpers).
-- The `rocia-db-sdk/proto` subpath export, exposing the generated
-  protobuf/gRPC types — see
-  [Advanced: Raw Protobuf Access](#advanced-raw-protobuf-access).
-
-Also improved in 0.6.0, purely as internal hardening — no call site needs to
-change for any of these:
-
-- The connect-timeout default (10,000 ms) was already in effect before
-  0.6.0; it is now backed by a single named internal constant, pinned to
-  match the Rust SDK's own `Duration::from_secs(10)` default, instead of
-  the same literal `10_000` repeated in two places — see
-  [Connecting](#connecting). This constant is not part of the public API
-  surface (it is not re-exported from the package root).
-- `putNodes`, `addEdges`, and the neighbor-node helpers
-  (`getOutgoingNeighborNodes`, `getIncomingNeighborNodes`) now actively
-  cancel every other already-dispatched call in a batch as soon as one item
-  fails, instead of merely letting them run to completion unobserved. This
-  reduces wasted server-side work on a batch that is going to be reported as
-  failed anyway; it does not change what "not atomic" means for these
-  methods (see [Nodes and batches](#nodes-and-batches) and
-  [Directed edges and neighbors](#directed-edges-and-neighbors)) or what a
-  caller should do to resume — reuse the same `requestId` values on retry,
-  exactly as before.
-- `RociaDbError`'s constructor now requires its `options` argument
-  (previously optional) and requires `kind` within it. This only affects
-  code that constructs `RociaDbError` directly — uncommon, since almost all
-  call sites only catch and read it; every existing
-  `catch`/`instanceof`/`.code`/`.reason` read of a `RociaDbError` the SDK
-  throws is unaffected.
-
-0.6.0 is released together with, and version-numbered to match, the Rust
-SDK's own 0.6.0 — a byproduct of bringing the two to capability parity in
-the same pass, not a versioning scheme this changelog is committing either
-SDK to for future releases.
-
-## Migrating to 0.3.0
-
-Two changes in this release fix data-loss and upload-rejection bugs; both
-require caller changes.
-
-**`FileUploadOptions.chunkSize` was removed.** Upload chunking now always
-uses the server's fixed 1 MiB boundary internally and is no longer a caller
-choice — delete `chunkSize` from any `uploadFile(...)` call:
-
-```diff
- await client.uploadFile(tenant, bucket, fileId, payload, {
-   contentType: "text/plain",
--  chunkSize: 64 * 1024,
- });
-```
-
-There is no replacement option: 1 MiB is the only chunk size the server
-accepts, so nothing you could set `chunkSize` to would have been meaningful.
-
-**A checksum is now required, and previously every default-configuration
-upload was silently rejected.** Before this release, the SDK forwarded
-whatever `checksum` you passed — including nothing at all — and the server
-rejects any checksum that is not exactly 32 bytes, so uploads made without
-an explicit checksum failed with `INVALID_ARGUMENT`. Two independent fixes:
-
-- `uploadFile` now computes a SHA-256 digest of the buffer automatically
-  when `options.checksum` is omitted — most callers need no code change
-  beyond removing `chunkSize` as above.
-- `uploadFileStream`'s `file.checksum` field changed from optional to
-  **required**. Since the checksum has to travel on the RPC's first
-  message, before the SDK has read anything from your source, it cannot be
-  computed automatically the way `uploadFile` computes it for an in-memory
-  buffer — hash your source ahead of time and pass the digest in. See
-  [Streaming an upload without buffering the whole file](#streaming-an-upload-without-buffering-the-whole-file)
-  for a worked example.
-
-**Uploads made through `uploadFileStream` with a pre-0.3.0 SDK against a
-source that yielded chunks smaller than 1 MiB — the common case, since
-`fs.createReadStream()`'s default is 64 KiB — were stored correctly but
-silently truncated on every subsequent download**, per the upload wire
-contract of the day. This version fixes the re-chunking so newly uploaded
-files are no longer affected, but it cannot repair files already stored
-short. There is no way to detect the truncation from `statFile` alone:
-`sizeBytes` reflects what was declared and validated at upload time (the
-total bytes across all chunks summed to it), not what `downloadFile` can
-actually reconstruct with the old chunk layout. Verify suspect files by
-downloading and comparing the returned length against `metadata.sizeBytes`,
-or simply re-upload the ones you still have the source for.
-
-**This section was accurate at the time it was written, against every
-server version up to `1.0.0-rc.15`.** Server `1.0.0-rc.16` (see
-[Migrating to 0.6.0](#migrating-to-060)) changed the download side of this
-contract: it now reads back exactly `sizeBytes` bytes instead of guessing
-`ceil(sizeBytes / 1 MiB)` chunk indexes, so an upload chunked at anything
-other than exactly 1 MiB no longer corrupts a later download. This SDK's
-behavior described above did not need to change — `uploadFileStream`
-already always emitted exactly-1-MiB chunks — but the *reason* it still
-does is now efficiency and pre-`rc.16` compatibility, not correctness
-against the current server. See
-[The upload wire contract](#the-upload-wire-contract) for the current
-rules.
 
 ## Development and Publication
 
