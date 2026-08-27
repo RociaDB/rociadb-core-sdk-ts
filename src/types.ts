@@ -90,10 +90,11 @@ export interface FileMetadata {
 }
 
 /**
- * Controls an in-memory file upload. Chunking always uses the server's fixed 1 MiB
- * chunk size and is not configurable: sending a different chunk size than the server
- * reads back (also 1 MiB) silently truncates downloads, so the option was removed
- * rather than kept as a footgun.
+ * Controls an in-memory file upload. Chunking is fixed at 1 MiB and is not
+ * configurable: that is the server's per-message ceiling, so it is the fewest
+ * messages a file can be sent in, and it is also the only chunking that stays
+ * safe against a pre-`1.0.0-rc.16` server, which reassembled downloads by a
+ * guessed chunk count. The knob was dropped rather than kept as a footgun.
  *
  * If `checksum` is omitted, the SDK computes a SHA-256 digest of `bytes` automatically
  * (the server rejects any checksum whose length is not exactly 32 bytes). If supplied,
@@ -124,6 +125,27 @@ export interface FileStreamUpload {
   requestId?: string;
 }
 
+/**
+ * One message of a raw, caller-driven upload stream (see {@link RociaDbClient.uploadFileRaw}).
+ *
+ * Unlike {@link FileStreamUpload}, every field here travels on the wire exactly as given,
+ * for every message — there is no assisted re-chunking and no first-message/later-message
+ * distinction. The caller is fully responsible for the server's wire contract: the first
+ * message must carry `tenantId`, `bucket`, `fileId`, the exact total `sizeBytes`, and a
+ * 32-byte SHA-256 `checksum`; `chunk` must be at most 1 MiB per message; and metadata
+ * fields after the first message are ignored by the server and may be left empty.
+ */
+export interface RawUploadMessage {
+  tenantId: string;
+  bucket: string;
+  fileId: string;
+  sizeBytes: bigint;
+  contentType: string;
+  checksum: Uint8Array;
+  chunk: Uint8Array;
+  requestId: string;
+}
+
 /** OAuth2 client-credentials configuration used for outgoing gRPC metadata. */
 export interface ClientCredentials {
   tokenUrl: string;
@@ -140,24 +162,44 @@ export interface RociaDbClientOptions {
 }
 
 /**
+ * Discriminates the failure kind of a {@link RociaDbError} without splitting it into a
+ * class hierarchy (which would break existing `instanceof RociaDbError` checks). This is
+ * the functional TypeScript equivalent of matching on Rust's `RociaDbError` enum variants
+ * (`Status`, `Connection`, `Auth`, `Encode`, `Decode`, `Validation`).
+ */
+export type RociaDbErrorKind = "status" | "connection" | "auth" | "encode" | "decode" | "validation";
+
+/**
  * Error raised by the SDK.
  *
- * For gRPC failures, {@link code} contains the grpc-js status code and `cause` retains
- * the original service error. {@link reason} carries the server's `reason` trailing
- * metadata (one of `invalid_argument`, `not_found`, `already_exists`, `permission_denied`,
- * `unauthenticated`, or `internal`), which is finer-grained than `code` alone — for
- * example it distinguishes `UNAUTHENTICATED` (the token expired; refresh and retry, see
- * {@link RociaDbClient.invalidateToken}) from `PERMISSION_DENIED` (the token's scope is
+ * {@link kind} discriminates the failure without requiring a class hierarchy: `"status"`
+ * is a failed (or empty) gRPC response, `"connection"` covers endpoint/host/auth-config
+ * setup and connecting, `"auth"` covers OAuth2 token acquisition, `"encode"`/`"decode"`
+ * cover JSON (de)serialization, and `"validation"` covers a client-side rule rejected
+ * before any network call.
+ *
+ * For gRPC failures (`kind === "status"`), {@link code} contains the grpc-js status code
+ * and `cause` retains the original service error. {@link reason} carries the server's
+ * `reason` trailing metadata (one of `invalid_argument`, `not_found`, `already_exists`,
+ * `permission_denied`, `unauthenticated`, or `internal`), which is finer-grained than
+ * `code` alone — for example it distinguishes `UNAUTHENTICATED` (the token expired;
+ * refresh and retry, see {@link RociaDbClient.invalidateToken} and
+ * {@link RociaDbClient.refreshAuthToken}) from `PERMISSION_DENIED` (the token's scope is
  * insufficient; retrying will not help).
  */
 export class RociaDbError extends Error {
+  readonly kind: RociaDbErrorKind;
   readonly code?: status;
   readonly reason?: string;
 
-  constructor(message: string, options?: { cause?: unknown; code?: status; reason?: string }) {
-    super(message, { cause: options?.cause });
+  constructor(
+    message: string,
+    options: { kind: RociaDbErrorKind; cause?: unknown; code?: status; reason?: string },
+  ) {
+    super(message, { cause: options.cause });
     this.name = "RociaDbError";
-    this.code = options?.code;
-    this.reason = options?.reason;
+    this.kind = options.kind;
+    this.code = options.code;
+    this.reason = options.reason;
   }
 }

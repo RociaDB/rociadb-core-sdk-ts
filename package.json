@@ -1,6 +1,6 @@
 {
   "name": "rocia-db-sdk",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "description": "TypeScript client SDK for RociaDB document, graph, and file gRPC services",
   "license": "Apache-2.0",
   "type": "module",
@@ -11,6 +11,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./proto": {
+      "types": "./dist/proto.d.ts",
+      "import": "./dist/proto.js"
     }
   },
   "files": [

@@ -88,6 +88,25 @@ You may also call `RociaDbClient.connect(options)` directly. Create one client
 per upstream configuration, reuse it across requests, and call `client.close()`
 during graceful shutdown.
 
+`.connectTimeout(timeoutMs)` sets the deadline applied while every service
+connects; call it on the builder before `.build()`, or pass
+`connectTimeoutMs` directly to `RociaDbClient.connect(options)`. When
+neither is supplied, the client falls back to its own default —
+**10,000 ms (10 seconds)**, pinned to match the Rust SDK's own
+`Duration::from_secs(10)` default so a connect-timeout choice behaves
+identically from either SDK. `build()`/`connect()` always applies some
+timeout, so a slow or unreachable DNS/TCP target fails after a bounded wait
+instead of hanging the returned promise forever. Passing zero, a negative
+number, or a non-finite value to `.connectTimeout()` throws a
+`RociaDbError` (`kind: "connection"`) immediately, before any connection
+attempt.
+
+`.host(...)` must resolve to a bare hostname and port — no path component
+beyond an absent one or a lone `/`. A mistyped host with a leftover path
+(`http://127.0.0.1:50051/v1`, pasted from somewhere else) is rejected with
+`RociaDbError` (`kind: "connection"`) before any connection attempt, rather
+than silently dialing the host and dropping the path.
+
 ## Authentication
 
 Every call carries a bearer token as gRPC metadata:
@@ -126,9 +145,10 @@ These two statuses look similar but call for opposite handling:
   because a fresh token carries the same scope. Two causes exist:
   - a **read-only** scoped client called one of the 7 write RPCs:
     `putDocument`/`createDocument`, `deleteDocument`, `putNode`/`putNodes`,
-    `addEdge`/`addEdges`, `deleteEdge`, `uploadFile`/`uploadFileStream`, or
-    `deleteFile`. A read-only token is not otherwise crippled — all 15 read
-    RPCs remain available.
+    `addEdge`/`addEdges`, `deleteEdge`,
+    `uploadFile`/`uploadFileStream`/`uploadFileRaw`, or `deleteFile`. A
+    read-only token is not otherwise crippled — all 15 read RPCs remain
+    available.
   - an **admin**-scoped token was presented — the credentials used to manage
     `rocia-idp` service accounts, not to read or write data. It is rejected
     on all 22 RPCs, reads included. If a read you expect to work returns
@@ -151,6 +171,79 @@ try {
   }
 }
 ```
+
+### Two ways to recover from `UNAUTHENTICATED`
+
+`invalidateToken()` (shown above) is **lazy**: it is synchronous, returns
+immediately, and does not itself make a network call — it only drops the
+cached token, so the very next internal `metadata()` call, made just before
+the next RPC (whichever call that turns out to be), sees no valid token and
+fetches a fresh one as part of dispatching that call. `refreshAuthToken()` is
+its **eager** counterpart: it `await`s the round trip to the identity
+provider itself and only resolves once a fresh token is confirmed and
+cached, or rejects with the fetch failure — the right choice immediately
+before retrying the call that just failed, so the retry's own `metadata()`
+call finds an already-fresh token instead of paying the refresh latency
+inline:
+
+```ts
+try {
+  await client.getDocument("tenant-1", "products", "sku-123");
+} catch (error) {
+  if (error instanceof RociaDbError && error.code === status.UNAUTHENTICATED) {
+    await client.refreshAuthToken(); // await the round trip once, here...
+    await client.getDocument("tenant-1", "products", "sku-123"); // ...then retry with it already cached
+  } else {
+    throw error;
+  }
+}
+```
+
+Reach for `invalidateToken()` instead when you just want to mark the cached
+token stale without blocking on a fresh one right now — a fire-and-forget
+error handler that is not about to retry immediately, for example. Both are
+no-ops when the client was built with `disableAuth()`. Neither ever discards
+a still-valid cached token just because an opportunistic refresh attempt
+failed: the internal `metadata()` call made before every RPC keeps injecting
+the last known-good token until a replacement is confirmed — a refresh
+hiccup inside the `refreshSkewMs` margin logs a warning and reuses the
+cached token rather than failing the in-flight call outright.
+
+### Auth Helpers
+
+`TokenManager` and `fetchOAuthToken` are exported from the package root for
+callers who need OAuth2 token handling outside of a `RociaDbClient` — for
+example, to reuse the same access token against a different service:
+
+```ts
+import { TokenManager, fetchOAuthToken } from "rocia-db-sdk";
+
+// One-off token exchange, no caching or refresh:
+const token = await fetchOAuthToken({
+  tokenUrl: "https://auth.example.com/oauth/token",
+  clientId: "client-id",
+  clientSecret: "client-secret",
+});
+console.log(token.accessToken, token.tokenType, token.expiresIn);
+
+// Cached, self-refreshing token manager — the same one RociaDbClient uses internally:
+const tokenManager = new TokenManager({
+  tokenUrl: "https://auth.example.com/oauth/token",
+  clientId: "client-id",
+  clientSecret: "client-secret",
+});
+await tokenManager.initialize(); // fetch the first token eagerly, fail fast if it's wrong
+const metadata = await tokenManager.metadata(); // grpc.Metadata with "authorization" set
+```
+
+`fetchOAuthToken` performs one token exchange and returns; it does not cache
+or refresh anything. `new TokenManager(config)` is synchronous — call
+`initialize()` (or let the first `metadata()` call do it lazily) before
+using it. Unlike the Rust SDK's `TokenManager`, there is no separate
+background refresh task to spawn or hold a guard for: `metadata()` itself
+checks the cached token's age against `refreshSkewMs` (30 seconds by
+default) every time it is called and refreshes inline when needed — the same
+check `RociaDbClient` relies on internally before every RPC.
 
 For a controlled local environment only, skip authentication entirely with
 `disableAuth()` (see [Connecting](#connecting)).
@@ -400,44 +493,82 @@ payload once the ID is known.
 
 ## Files
 
-### The upload protocol
+Three levels of upload help exist, from most to least hand-holding:
+`uploadFile` (buffers the whole file in memory, computes the checksum for
+you), `uploadFileStream` (streams arbitrarily-sized chunks without buffering
+the whole file — you supply the checksum, but it still re-chunks and
+validates everything else for you), and `uploadFileRaw` (a raw pass-through —
+you build every protobuf message yourself, with zero validation). The wire
+contract all three implement is worth understanding even if you only ever
+call `uploadFile`.
 
-Understanding how uploads are transported explains every constraint below.
-`Upload` is a client-streaming RPC: the **first** message carries the file's
-metadata (`tenantId`, `bucket`, `fileId`, `sizeBytes`, `contentType`,
-`checksum`, `requestId`); every message after that carries only a `chunk`.
-The server stores one chunk per non-empty message, at a sequential index
-starting from 0. On download, it computes `ceil(sizeBytes / 1 MiB)` and
-reads back exactly that many stored chunks, concatenated in order.
+### The upload wire contract
 
-That reconstruction rule is why chunk size is not a free choice: **every
-outgoing message must carry exactly 1 MiB, except the last one, which
-carries the remainder.** A client that instead wrote messages sized to
-whatever it read from its source — for example the 64 KiB pieces
-`fs.createReadStream` yields by default — would still have its upload
-accepted (the total byte count still matches `sizeBytes`), but the file
-would come back truncated on download, silently, with no error at upload or
-download time. `uploadFile` and `uploadFileStream` regroup whatever pieces
-you hand them into correctly sized 1 MiB messages internally, so a plain
-`createReadStream()` is safe to pass directly; see
-[Migrating to 0.3.0](#migrating-to-030) if you are upgrading from a version
-that let you choose the chunk size yourself.
+`Upload` is a client-streaming RPC:
 
-Other server-enforced limits:
+- **The first message carries the file's metadata** — `tenantId`, `bucket`,
+  `fileId`, `sizeBytes` (the exact total byte count), `contentType`,
+  `checksum`, and `requestId`. Every later message is only read for its
+  `chunk` field; metadata fields on those later messages are ignored.
+- **Chunk size is the client's choice, capped at 1 MiB — not a fixed
+  requirement.** The server stores each chunk verbatim at its position in
+  the stream and, on download, reads chunks back until it has collected
+  `sizeBytes` bytes in total — it does not assume any particular chunk size
+  when replaying them. A single message's `chunk` larger than 1 MiB is
+  rejected outright with `INVALID_ARGUMENT`; anything at or under that cap
+  is fine, sliced however the client likes. `uploadFile` and
+  `uploadFileStream` (below) both still always emit exactly-1-MiB messages
+  (the last one may be shorter) — not because the server requires it, but
+  because 1 MiB is the largest message the server allows, so it is also the
+  fewest possible messages for a given file; this is also why neither
+  `FileUploadOptions` nor `FileStreamUpload` has a `chunkSize` option. See
+  [Migrating to 0.3.0](#migrating-to-030) for why a caller-chosen chunk size
+  used to be dangerous, and [Migrating to 0.6.0](#migrating-to-060) for why
+  it no longer is against a current server.
+- **`checksum` must be exactly 32 raw bytes — a SHA-256 digest.** Any other
+  length, including empty, is rejected with `INVALID_ARGUMENT` before a
+  single chunk is read. The server does not verify that the checksum
+  actually matches the uploaded bytes, only that its length is correct.
+- **The sum of every `chunk`'s bytes across the stream must equal
+  `sizeBytes` exactly**, or the server rejects the upload with
+  `INVALID_ARGUMENT` at the end of the stream — this is what makes
+  `sizeBytes` a value the SDK, and the server on download, can trust, rather
+  than just a caller-supplied claim.
+- **Re-uploading an existing `fileId` replaces it, with no error for the
+  duplicate** — no separate delete-then-upload dance is required.
+  `downloadFile`/`statFile` afterward always serve the newest upload.
+- **Files are capped at the server's `limits.max_file_bytes`** (5 GiB by
+  default). `uploadFile` and `uploadFileStream` check this client-side,
+  before any RPC, and throw a `RociaDbError` (`kind: "validation"`) if it is
+  exceeded.
+- **An empty file is valid and common**: it needs exactly one message
+  (metadata only, empty `chunk`) and no data messages. `uploadFile` and
+  `uploadFileStream` both send it automatically.
+- **The file only becomes visible** (in `listFiles`, `statFile`,
+  `downloadFile`) once the whole stream has been received and validated. An
+  interrupted stream leaves orphaned chunks that a background GC eventually
+  reclaims; the partial file never appears anywhere, so retrying (with a
+  fresh `requestId`) is always safe.
+- **`deleteFile` removes a whole file by prefix**, regardless of how many
+  chunks it was stored in or what chunk size wrote them.
 
-- **Checksum**: `checksum` must be exactly 32 raw bytes — a SHA-256 digest.
-  Any other length, including empty, is rejected with `INVALID_ARGUMENT`
-  before a single chunk is read. The server does not verify that the
-  checksum matches the uploaded bytes, only that its length is correct.
-- **Size**: files are capped at the server's `limits.max_file_bytes` (5 GiB
-  by default). The SDK checks this client-side, before any RPC, in both
-  `uploadFile` and `uploadFileStream`.
-- **Empty files work**: a zero-byte file still needs one message to deliver
-  its metadata; the SDK sends it automatically.
-- **An interrupted stream leaves orphaned chunks.** The file only becomes
-  visible in `listFiles` and `statFile` once the upload completes and the
-  server finishes validating it — a partial upload never appears, so there
-  is nothing to clean up, and retrying (with a fresh `requestId`) is safe.
+Server `1.0.0-rc.16` changed the *download* side of this contract, which is
+why the bullets above no longer mention a fixed chunk size: **before
+`rc.16`, the server derived how many chunks to read back on download as
+`ceil(sizeBytes / 1 MiB)`, so any upload chunk size other than exactly 1 MiB
+made a later download silently return truncated or garbled data, with no
+error at all, at upload or download time.** That is why this SDK has always
+defaulted to exactly-1-MiB chunking in `uploadFile`/`uploadFileStream`, and
+why it still does: this chunking remains correct, and is still the most
+efficient choice, against `rc.16`, and it is the only chunking that stays
+safe against a pre-`rc.16` server. The same guessed-chunk-count assumption
+affected `Delete` before `rc.16` too (it stopped after the same assumed
+chunk count, leaving a tail of orphaned chunks behind for any file that had
+used a different chunk size); `Delete` removing by prefix, as described
+above, is also new as of `rc.16`. See
+[Migrating to 0.6.0](#migrating-to-060) for the full correction and
+[Migrating to 0.3.0](#migrating-to-030) for the historical bug this SDK
+originally shipped a fix for.
 
 ### Buffered files
 
@@ -469,7 +600,7 @@ digest; hex-encode it for display or comparison, as shown above. If you
 already have a checksum computed elsewhere, pass it as `options.checksum`
 instead — it must be exactly 32 bytes, checked before any network call.
 
-### Streaming large files
+### Streaming an upload without buffering the whole file
 
 Streaming avoids holding the complete object in memory. The caller must know
 the total upload size **and a precomputed SHA-256 checksum** before starting
@@ -516,7 +647,63 @@ await pipeline(
 The source iterable may yield chunks of any size — the second
 `createReadStream` call above reads the file again at its default 64 KiB —
 because `uploadFileStream` re-buffers internally and only ever writes 1 MiB
-per outgoing message, per [The upload protocol](#the-upload-protocol) above.
+per outgoing message, per
+[The upload wire contract](#the-upload-wire-contract) above.
+
+**Naming trap when porting code between SDKs:** despite doing this
+re-chunking and validation, this method is not the raw, zero-validation
+escape hatch — that is `uploadFileRaw`, covered next. The Rust SDK's
+`upload_file_stream` *is* that raw escape hatch there; this method's
+counterpart on the Rust side is instead named `upload_file_chunked`. See
+[Parity with the Rust SDK](#parity-with-the-rust-sdk) for the full naming
+table before porting upload code between the two SDKs by name alone.
+
+### Raw streaming upload escape hatch
+
+`uploadFileRaw` passes every message straight through to the gRPC call
+exactly as given — **no re-chunking, no checksum validation, and no
+distinction between the first message and the rest.** You are fully
+responsible for the wire contract described in
+[The upload wire contract](#the-upload-wire-contract) above: the first
+`RawUploadMessage` must carry `tenantId`, `bucket`, `fileId`, the exact
+total `sizeBytes`, and a 32-byte SHA-256 `checksum`; every message's
+`chunk` must be at most 1 MiB, or the upload fails with
+`INVALID_ARGUMENT`; `sizeBytes` must equal the exact sum of every `chunk`
+sent; and the metadata fields on messages after the first are ignored by
+the server and may be left empty.
+
+```ts
+import { createHash, randomUUID } from "node:crypto";
+import type { RawUploadMessage } from "rocia-db-sdk";
+
+async function* rawUpload(): AsyncGenerator<RawUploadMessage> {
+  const payload = Buffer.from("hello RociaDB");
+  yield {
+    tenantId: "tenant-1",
+    bucket: "assets",
+    fileId: "manual.txt",
+    sizeBytes: BigInt(payload.byteLength),
+    contentType: "text/plain",
+    checksum: createHash("sha256").update(payload).digest(),
+    chunk: payload,
+    requestId: `upload_file:${randomUUID()}`,
+  };
+  // A larger file would yield further messages here, chunk <= 1 MiB each;
+  // metadata fields on those later messages are ignored by the server and
+  // can be left blank.
+}
+
+await client.uploadFileRaw(rawUpload());
+```
+
+As of server `rc.16`, getting the chunk *size* wrong here fails fast with
+`INVALID_ARGUMENT` rather than silently corrupting a later download — but a
+wrong `sizeBytes` total, or a `checksum` that does not actually match the
+bytes (the server only checks its length, never its content), can still
+slip through as an upload that looks successful while carrying bad data.
+Prefer `uploadFile` or `uploadFileStream` above unless you specifically need
+to hand-build the message stream — for example to interleave upload
+messages with transport-level logic that neither assisted helper exposes.
 
 ### Discovering buckets and files
 
@@ -578,10 +765,27 @@ request ID per item when none is supplied.
 
 ## Error Handling
 
-All SDK failures use `RociaDbError`. For gRPC failures, `code` contains a
-standard `@grpc/grpc-js` status code, `reason` carries the server's `reason`
-gRPC trailing metadata (finer-grained than `code` alone), and `cause`
-retains the original error:
+All SDK failures use `RociaDbError`. Every instance carries a
+`kind: RociaDbErrorKind` field — one of six values — that discriminates
+*why* the call failed without requiring a class hierarchy (which would break
+any existing `error instanceof RociaDbError` check):
+
+| `kind` | Meaning |
+|---|---|
+| `"status"` | A gRPC call returned a non-OK status, or an unexpectedly empty response. `code`/`reason` (below) narrow this further. |
+| `"connection"` | Failed to connect to, or configure, the endpoint — invalid host, TLS setup, connection refused, missing builder configuration, a non-positive connect timeout. |
+| `"auth"` | Failed to obtain or refresh the OAuth2 bearer token (`fetchOAuthToken`/`TokenManager`). |
+| `"encode"` | Failed to `JSON.stringify` a document, node, or edge payload before sending it. |
+| `"decode"` | Failed to `JSON.parse` a payload received from the server, or to parse a wire `uint64` into a `bigint`. |
+| `"validation"` | A client-side rule was rejected before any network call — a non-positive page `limit`, a checksum of the wrong length, a file size out of bounds, a partial `nodeLabel`/`nodeGraph` pair, and so on. |
+
+For gRPC failures (`kind === "status"`), `code` contains a standard
+`@grpc/grpc-js` status code, `reason` carries the server's `reason` gRPC
+trailing metadata (finer-grained than `code` alone), and `cause` retains the
+original error. The other five kinds usually carry no `code`/`reason` at
+all, since they are raised client-side before any RPC. Narrow on `kind`
+first to handle a whole category (every validation error alike, say), and
+on `code`/`reason` for gRPC-specific branching:
 
 ```ts
 import { status } from "@grpc/grpc-js";
@@ -590,7 +794,8 @@ import { RociaDbError } from "rocia-db-sdk";
 try {
   await client.getDocument("tenant-1", "products", "missing");
 } catch (error) {
-  if (error instanceof RociaDbError && error.code === status.NOT_FOUND) {
+  if (!(error instanceof RociaDbError)) throw error;
+  if (error.kind === "status" && error.code === status.NOT_FOUND) {
     console.log("document does not exist");
   } else {
     throw error;
@@ -607,10 +812,28 @@ try {
 | `UNAUTHENTICATED` | `unauthenticated` | Token missing, expired, malformed, or from another issuer — see [Authentication](#authentication) |
 | `INTERNAL` | `internal` | Storage-layer failure |
 
-OAuth failures, invalid configuration, JSON encoding/decoding errors, invalid
-pagination arguments, and invalid file sizes or checksums also use
-`RociaDbError`, usually without a gRPC `code` or `reason` since they are
-caught client-side before any RPC is made.
+OAuth failures (`kind: "auth"`), invalid configuration (`kind:
+"connection"`), JSON encoding/decoding errors (`kind: "encode"`/`"decode"`),
+and invalid pagination arguments or file sizes/checksums (`kind:
+"validation"`) also use `RociaDbError`, usually without a gRPC `code` or
+`reason` since they are caught client-side before any RPC is made.
+
+## Advanced: Raw Protobuf Access
+
+`rocia-db-sdk/proto` exports the generated request/response shapes and gRPC
+service-client interfaces backing every `RociaDbClient` method, for callers
+who need to build a custom gRPC client against the same `.proto` file
+instead of going through `RociaDbClient`:
+
+```ts
+import { createServiceClients } from "rocia-db-sdk/proto";
+```
+
+This module mirrors the Rust SDK's `#[doc(hidden)] pub mod pb` — it is
+**not** part of this package's semver contract. A routine
+`@grpc/proto-loader` upgrade can reshape it without the rest of the SDK's
+own API changing at all. Depend on it only if you accept that its shapes can
+change between any two versions of `rocia-db-sdk`.
 
 ## API Coverage
 
@@ -631,13 +854,157 @@ caught client-side before any RPC is made.
 | Graph | `NeighborsIn` | `neighborsIn`, `getIncomingNeighborNodes<T>` |
 | Graph | `ListGraphs` | `listGraphs` |
 | Graph | `ListNodes` | `listNodes` |
-| File | `Upload` | `uploadFile`, `uploadFileStream` |
+| File | `Upload` | `uploadFile`, `uploadFileStream`, `uploadFileRaw` |
 | File | `Download` | `downloadFile`, `downloadFileStream` |
 | File | `Stat` | `statFile` |
 | File | `Delete` | `deleteFile` |
 | File | `ListBuckets` | `listBuckets` |
 | File | `ListFiles` | `listFiles` |
 | Tenant | `ListTenants` | `listTenants` |
+
+## Parity with the Rust SDK
+
+This SDK and the Rust SDK
+([`rociadb-core-sdk-rust`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust))
+cover the same 22 RPCs against the same server, and are maintained to the
+same standard: **every capability available in one is available in the
+other.** Neither imitates the other's syntax — this package stays
+camelCase/exception-idiomatic TypeScript, the Rust crate stays
+snake_case/`Result`-idiomatic Rust — but a piece of client code should
+always have a mechanical translation from one SDK to the other. Parity is
+about what you can *do*, not about matching method names character for
+character, and most names do translate mechanically (`putNodes` ↔
+`put_nodes`, `getOutgoingNeighborNodes` ↔ `get_outgoing_neighbor_nodes`, and
+so on). The handful of places where a name does **not** translate
+mechanically — where translating a call by ear lands you on the wrong
+method — are the naming table below.
+
+| Capability | TypeScript (this SDK) | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust)) | Note |
+|---|---|---|---|
+| Assisted streaming upload — re-chunks to the 1 MiB wire contract, validates the total, caller supplies the checksum | `uploadFileStream` | `upload_file_chunked` | Names do **not** correspond — see the naming trap below. |
+| Raw streaming upload — zero validation, caller builds every protobuf message | `uploadFileRaw` | `upload_file_stream` | Names do **not** correspond — the mirror image of the row above. |
+| Idempotency key scoped to a `createDocument` call's document write only (the graph node binding keeps its own auto-generated key) | `createDocument(..., { requestId })` — an options-object field | `create_document_with_request_id` — a sibling method, `request_id: impl Into<String>` | Same capability, different shape: an options field vs. a sibling method, the established pattern on each side. |
+| Releasing the connection and any cached auth state | `client.close()` | Drop the last live `RociaDbClient` clone | No Rust method by design — see below. |
+| Lazy token invalidation at the level of the token-caching type itself (not the client-level wrapper, which *does* translate mechanically: `invalidateToken` ↔ `invalidate_auth_token`) | `TokenManager.invalidate()` | `TokenManager::request_refresh` | Different verb chosen independently on each side for the same "mark it stale, refresh on next use" idea. |
+| Standalone OAuth2 token fetch, usable outside of `TokenManager` | `fetchOAuthToken` (exported from `auth.ts`, re-exported at the package root) | `auth::fetch_token` | TypeScript needed a name that does not collide with the `fetch` Web API it wraps; Rust has no such collision. |
+| Discriminating why an error happened | `RociaDbError.kind: RociaDbErrorKind`, one class with a `"status" \| "connection" \| "auth" \| "encode" \| "decode" \| "validation"` field | `RociaDbError` — a `match`-able enum: `Status { .. }` / `Connection { .. }` / `Auth { .. }` / `Encode { .. }` / `Decode { .. }` / `Validation(String)` | Different shape, not just a different name — see below. |
+| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | the `rocia-db-sdk/proto` subpath export (see [Advanced: Raw Protobuf Access](#advanced-raw-protobuf-access)) | the `pb` module (`#[doc(hidden)] pub mod pb`; the handful of generated types that reach a public signature are re-exported individually at the crate root instead) | Different mechanism, not just a different name: a separate `package.json` `exports` entry vs. an in-crate module. Neither is part of either package's semver contract. |
+
+**The upload naming trap, spelled out:** `uploadFileStream` (TypeScript) and
+`upload_file_chunked` (Rust) are the *same* capability — the middle tier
+that re-chunks and validates for you (see
+[Streaming an upload without buffering the whole file](#streaming-an-upload-without-buffering-the-whole-file)).
+`uploadFileRaw` (TypeScript) and `upload_file_stream` (Rust) are also the
+*same* capability — the raw, zero-validation escape hatch (see
+[Raw streaming upload escape hatch](#raw-streaming-upload-escape-hatch)).
+`uploadFileStream` and `upload_file_stream` are **not** each other's
+counterpart, despite the near-identical name: the TypeScript one is the
+validated middle tier, the Rust one is the raw escape hatch. Porting upload
+code between the two SDKs by matching names alone silently swaps which tier
+you land on — always cross-check against the table above, not against how
+the name sounds.
+
+**The error-kind trap, spelled out:** both sides recognize the exact same
+six causes, in the same order, but represent the choice differently.
+TypeScript keeps a single `RociaDbError` class (so an existing `error
+instanceof RociaDbError` check never breaks) and puts the six-way choice in
+a `kind` field — narrowing on `error.kind` gets the same exhaustiveness
+check from `tsc` that Rust's `match` gets from `rustc`, just via a
+discriminated union instead of an enum variant. Rust's `RociaDbError` is a
+real sum type — matching on it is exhaustive, and the compiler flags a
+missing arm. Neither representation is "the same code translated"; each is
+the idiomatic way to express one closed set of causes in its own language.
+
+**Why there is no Rust `close()`:** this SDK's `RociaDbClient` owns its gRPC
+channels outright — `close()` tears them down, and the instance must not be
+reused afterward. Rust's `RociaDbClient` is instead `Clone`, and every clone
+shares one underlying channel and one background refresh task by design; a
+`close(&self)` there would tear the channel down out from under every other
+live clone. The idiomatic Rust equivalent already exists and gives the
+identical guarantee: drop the last clone. Neither SDK is missing a
+capability — each expresses "release the connection" the way its own
+ownership model calls for.
+
+Two capabilities are intentionally kept on one side without a mirror on the
+other: `ApiKeyInterceptor` (Rust only — it validates an *incoming* API key,
+so it serves building a server or a test double, not talking to RociaDB,
+which puts it out of scope for a client SDK), and having both
+`RociaDbBuilder.build()` and a direct `RociaDbClient.connect(options)` entry
+point (this SDK only — the builder here is a thin wrapper with no
+capability of its own beyond `connectTimeoutMs`, `authClientCredentials`,
+and `disableAuth`, so duplicating a second entry point in Rust would add an
+API to maintain for zero new capability).
+
+## Migrating to 0.6.0
+
+0.6.0 brings this SDK to full capability parity with the Rust SDK — see
+[Parity with the Rust SDK](#parity-with-the-rust-sdk) above. **Every public
+method, type, and option that existed in 0.3.0 still exists, with the same
+signature and the same behavior — this release only adds.** Nothing is
+removed, nothing already-shipped becomes an error, and every new capability
+below is opt-in: existing call sites keep compiling and behaving exactly as
+before without touching them.
+
+**Documentation-only correction, no behavior change:** this README used to
+state that the server required upload chunks of exactly 1 MiB and that
+anything else silently corrupted a later download. That was accurate
+against every server up to `1.0.0-rc.15`, and is no longer accurate against
+`1.0.0-rc.16` and later — the server now reads a download back by
+`sizeBytes`, not by an assumed chunk count. This SDK's own chunking never
+needed to change (`uploadFile`/`uploadFileStream` already always emitted
+exactly-1-MiB chunks, which remains correct and is still the most efficient
+choice, and is still required for correctness against a pre-`rc.16` server)
+— only the documentation explaining *why* was wrong, and has been
+corrected. See [The upload wire contract](#the-upload-wire-contract) for
+the current rules and [Migrating to 0.3.0](#migrating-to-030) for the
+historical note.
+
+New capabilities added in 0.6.0, each documented where linked:
+
+- `RociaDbClient.refreshAuthToken()` — the eager counterpart to the existing
+  `invalidateToken()` — see
+  [Two ways to recover from `UNAUTHENTICATED`](#two-ways-to-recover-from-unauthenticated).
+- `RociaDbClient.uploadFileRaw()` and the `RawUploadMessage` type — the raw,
+  zero-validation escape hatch — see
+  [Raw streaming upload escape hatch](#raw-streaming-upload-escape-hatch).
+- `RociaDbError.kind: RociaDbErrorKind` — see
+  [Error Handling](#error-handling).
+- `fetchOAuthToken` and the `OAuthToken` type, now exported from the package
+  root — see [Auth Helpers](#auth-helpers).
+- The `rocia-db-sdk/proto` subpath export, exposing the generated
+  protobuf/gRPC types — see
+  [Advanced: Raw Protobuf Access](#advanced-raw-protobuf-access).
+
+Also improved in 0.6.0, purely as internal hardening — no call site needs to
+change for any of these:
+
+- The connect-timeout default (10,000 ms) was already in effect before
+  0.6.0; it is now backed by a single named internal constant, pinned to
+  match the Rust SDK's own `Duration::from_secs(10)` default, instead of
+  the same literal `10_000` repeated in two places — see
+  [Connecting](#connecting). This constant is not part of the public API
+  surface (it is not re-exported from the package root).
+- `putNodes`, `addEdges`, and the neighbor-node helpers
+  (`getOutgoingNeighborNodes`, `getIncomingNeighborNodes`) now actively
+  cancel every other already-dispatched call in a batch as soon as one item
+  fails, instead of merely letting them run to completion unobserved. This
+  reduces wasted server-side work on a batch that is going to be reported as
+  failed anyway; it does not change what "not atomic" means for these
+  methods (see [Nodes and batches](#nodes-and-batches) and
+  [Directed edges and neighbors](#directed-edges-and-neighbors)) or what a
+  caller should do to resume — reuse the same `requestId` values on retry,
+  exactly as before.
+- `RociaDbError`'s constructor now requires its `options` argument
+  (previously optional) and requires `kind` within it. This only affects
+  code that constructs `RociaDbError` directly — uncommon, since almost all
+  call sites only catch and read it; every existing
+  `catch`/`instanceof`/`.code`/`.reason` read of a `RociaDbError` the SDK
+  throws is unaffected.
+
+0.6.0 is released together with, and version-numbered to match, the Rust
+SDK's own 0.6.0 — a byproduct of bringing the two to capability parity in
+the same pass, not a versioning scheme this changelog is committing either
+SDK to for future releases.
 
 ## Migrating to 0.3.0
 
@@ -672,21 +1039,34 @@ an explicit checksum failed with `INVALID_ARGUMENT`. Two independent fixes:
   message, before the SDK has read anything from your source, it cannot be
   computed automatically the way `uploadFile` computes it for an in-memory
   buffer — hash your source ahead of time and pass the digest in. See
-  [Streaming large files](#streaming-large-files) for a worked example.
+  [Streaming an upload without buffering the whole file](#streaming-an-upload-without-buffering-the-whole-file)
+  for a worked example.
 
 **Uploads made through `uploadFileStream` with a pre-0.3.0 SDK against a
 source that yielded chunks smaller than 1 MiB — the common case, since
 `fs.createReadStream()`'s default is 64 KiB — were stored correctly but
-silently truncated on every subsequent download**, per
-[The upload protocol](#the-upload-protocol). This version fixes the
-re-chunking so newly uploaded files are no longer affected, but it cannot
-repair files already stored short. There is no way to detect the truncation
-from `statFile` alone: `sizeBytes` reflects what was declared and validated
-at upload time (the total bytes across all chunks summed to it), not what
-`downloadFile` can actually reconstruct with the old chunk layout. Verify
-suspect files by downloading and comparing the returned length against
-`metadata.sizeBytes`, or simply re-upload the ones you still have the
-source for.
+silently truncated on every subsequent download**, per the upload wire
+contract of the day. This version fixes the re-chunking so newly uploaded
+files are no longer affected, but it cannot repair files already stored
+short. There is no way to detect the truncation from `statFile` alone:
+`sizeBytes` reflects what was declared and validated at upload time (the
+total bytes across all chunks summed to it), not what `downloadFile` can
+actually reconstruct with the old chunk layout. Verify suspect files by
+downloading and comparing the returned length against `metadata.sizeBytes`,
+or simply re-upload the ones you still have the source for.
+
+**This section was accurate at the time it was written, against every
+server version up to `1.0.0-rc.15`.** Server `1.0.0-rc.16` (see
+[Migrating to 0.6.0](#migrating-to-060)) changed the download side of this
+contract: it now reads back exactly `sizeBytes` bytes instead of guessing
+`ceil(sizeBytes / 1 MiB)` chunk indexes, so an upload chunked at anything
+other than exactly 1 MiB no longer corrupts a later download. This SDK's
+behavior described above did not need to change — `uploadFileStream`
+already always emitted exactly-1-MiB chunks — but the *reason* it still
+does is now efficiency and pre-`rc.16` compatibility, not correctness
+against the current server. See
+[The upload wire contract](#the-upload-wire-contract) for the current
+rules.
 
 ## Development and Publication
 

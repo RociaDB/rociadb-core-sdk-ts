@@ -47,6 +47,7 @@ import type {
   NodeInput,
   Page,
   PageOptions,
+  RawUploadMessage,
   RociaDbClientOptions,
 } from "./types.js";
 import { RociaDbError } from "./types.js";
@@ -65,16 +66,26 @@ const QUERY_OPERATORS = { eq: 1, in: 2, contains: 3 } as const;
 const SORT_DIRECTIONS = { asc: 1, desc: 2 } as const;
 
 /**
- * Fixed on-disk chunk size enforced by the server (server.rs `CHUNK_SIZE`). Downloads
- * are reassembled by reading index `0..ceil(size_bytes / UPLOAD_CHUNK_BYTES)`, so every
- * upload message must carry exactly this many bytes except the last one — a smaller
- * chunk size uploads correctly but is silently truncated on download.
+ * Size of every upload message this SDK emits, except the last one. This is the
+ * server's per-message ceiling (server.rs `CHUNK_SIZE`); a larger message is
+ * refused with `INVALID_ARGUMENT`, so sending exactly this much is the fewest
+ * messages a file can take. Since `1.0.0-rc.16` the server reassembles a
+ * download from the recorded `size_bytes` rather than a guessed chunk count, so
+ * a smaller chunk size would also work — it would just cost more messages, and
+ * it would be unsafe against a pre-`rc.16` server.
  */
 const UPLOAD_CHUNK_BYTES = 1_048_576; // 1 MiB
 /** Server default `limits.max_file_bytes`; checked client-side to fail fast. */
 const MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB
 /** SHA-256 digest length the server requires ("checksum must be 32 bytes (sha256)"). */
 const CHECKSUM_BYTES = 32;
+/**
+ * Default connect deadline applied when {@link RociaDbBuilder.connectTimeout} is never
+ * called and {@link RociaDbClientOptions.connectTimeoutMs} is omitted. Must stay in sync
+ * with the Rust SDK's `Duration::from_secs(10)` default — the two SDKs are required to
+ * agree on this value.
+ */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
 interface Services {
   documents: DocumentServiceClient;
@@ -89,7 +100,7 @@ type NeighborDirection = "out" | "in";
 export class RociaDbBuilder {
   #host = "http://127.0.0.1:50051";
   #auth: ClientCredentials | false | undefined;
-  #connectTimeoutMs = 10_000;
+  #connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
 
   /** Set the gRPC endpoint. The URL scheme selects insecure HTTP or TLS. */
   host(host: string): this {
@@ -117,7 +128,7 @@ export class RociaDbBuilder {
   /** Set the deadline used while waiting for every gRPC service. */
   connectTimeout(timeoutMs: number): this {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-      throw new RociaDbError("Connect timeout must be greater than zero");
+      throw new RociaDbError("Connect timeout must be greater than zero", { kind: "connection" });
     }
     this.#connectTimeoutMs = timeoutMs;
     return this;
@@ -153,7 +164,7 @@ export class RociaDbClient {
     const tokenManager = auth === false ? undefined : new TokenManager(auth);
     await tokenManager?.initialize();
     let services: Services | undefined;
-    const timeout = options.connectTimeoutMs ?? 10_000;
+    const timeout = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     try {
       const connectedServices = createServiceClients(endpoint.address, endpoint.credentials);
       services = connectedServices;
@@ -171,9 +182,11 @@ export class RociaDbClient {
       if (services) {
         for (const client of Object.values(services)) client.close();
       }
-      throw new RociaDbError("Failed to connect to RociaDB", { cause });
+      throw new RociaDbError("Failed to connect to RociaDB", { kind: "connection", cause });
     }
-    if (!services) throw new RociaDbError("RociaDB services were not initialized");
+    if (!services) {
+      throw new RociaDbError("RociaDB services were not initialized", { kind: "connection" });
+    }
     return new RociaDbClient(services, tokenManager);
   }
 
@@ -193,6 +206,21 @@ export class RociaDbClient {
    */
   invalidateToken(): void {
     this.#tokenManager?.invalidate();
+  }
+
+  /**
+   * Force an immediate, blocking refresh of the auth token and wait for the round trip
+   * to complete before resolving.
+   *
+   * Call this after catching a {@link RociaDbError} whose `reason` is `"unauthenticated"`
+   * (or `code` is `grpc.status.UNAUTHENTICATED`), before retrying the call that just
+   * failed — unlike {@link invalidateToken}, which only marks the cached token stale and
+   * lets the next call pay the refresh latency, this eagerly fetches now so the retry
+   * itself does not race a still-in-flight refresh. A no-op resolved immediately when the
+   * client was built with `disableAuth()`.
+   */
+  async refreshAuthToken(): Promise<void> {
+    await this.#tokenManager?.refreshNow();
   }
 
   /** Create or replace a JSON document. Supply `requestId` when retrying a mutation. */
@@ -225,7 +253,9 @@ export class RociaDbClient {
     options: { nodeLabel?: string; nodeGraph?: string; requestId?: string } = {},
   ): Promise<void> {
     if ((options.nodeLabel === undefined) !== (options.nodeGraph === undefined)) {
-      throw new RociaDbError("nodeLabel and nodeGraph must be provided together");
+      throw new RociaDbError("nodeLabel and nodeGraph must be provided together", {
+        kind: "validation",
+      });
     }
     await this.putDocument(tenantId, collection, documentId, value, options.requestId);
     if (options.nodeLabel && options.nodeGraph) {
@@ -346,13 +376,20 @@ export class RociaDbClient {
     return { items: response.node_ids, nextCursor: optionalCursor(response.page?.next_cursor) };
   }
 
-  /** Create or replace one graph node using its complete node ID. */
+  /**
+   * Create or replace one graph node using its complete node ID.
+   *
+   * `signal`, when supplied, cancels the in-flight RPC if it aborts — used internally by
+   * {@link putNodes} to cancel a batch's other already-dispatched calls as soon as one
+   * fails; most callers invoking this directly have no need to pass it.
+   */
   async putNode(
     tenantId: string,
     graph: string,
     nodeId: string,
     value: unknown,
     requestId = `put_node:${randomUUID()}`,
+    signal?: AbortSignal,
   ): Promise<void> {
     const request: PutNodeRequest = {
       tenant_id: tenantId,
@@ -361,28 +398,45 @@ export class RociaDbClient {
       json: encodeJson(value),
       request_id: requestId,
     };
-    await unary("PutNode", this.#services.graph.putNode.bind(this.#services.graph), request, await this.#metadata());
+    await unary("PutNode", this.#services.graph.putNode.bind(this.#services.graph), request, await this.#metadata(), signal);
   }
 
-  /** Put nodes with at most ten in-flight RPCs. The batch is not atomic. */
+  /**
+   * Put nodes with at most ten in-flight RPCs. The batch is not atomic: as soon as one
+   * node fails, every other already-dispatched call in the batch is actively cancelled
+   * (not merely left to finish) rather than only stopping new ones from being scheduled.
+   */
   async putNodes<T>(tenantId: string, graph: string, nodes: readonly NodeInput<T>[]): Promise<void> {
-    await mapConcurrent(nodes, CONCURRENT_REQUESTS, async (node) =>
-      this.putNode(tenantId, graph, node.nodeId, node.value, node.requestId),
+    await mapConcurrent(nodes, CONCURRENT_REQUESTS, async (node, _index, signal) =>
+      this.putNode(tenantId, graph, node.nodeId, node.value, node.requestId, signal),
     );
   }
 
-  /** Fetch and JSON-decode one graph node into the caller-selected type. */
-  async getNode<T>(tenantId: string, graph: string, nodeId: string): Promise<T> {
+  /**
+   * Fetch and JSON-decode one graph node into the caller-selected type.
+   *
+   * `signal`, when supplied, cancels the in-flight RPC if it aborts — used internally by
+   * the neighbor-node helpers to cancel a batch's other already-dispatched calls as soon
+   * as one fails; most callers invoking this directly have no need to pass it.
+   */
+  async getNode<T>(tenantId: string, graph: string, nodeId: string, signal?: AbortSignal): Promise<T> {
     const request: GetNodeRequest = { tenant_id: tenantId, graph, node_id: nodeId };
-    const response = await unary("GetNode", this.#services.graph.getNode.bind(this.#services.graph), request, await this.#metadata());
+    const response = await unary("GetNode", this.#services.graph.getNode.bind(this.#services.graph), request, await this.#metadata(), signal);
     return decodeJson<T>(response.json);
   }
 
-  /** Create or replace one directed edge and its JSON payload. */
+  /**
+   * Create or replace one directed edge and its JSON payload.
+   *
+   * `signal`, when supplied, cancels the in-flight RPC if it aborts — used internally by
+   * {@link addEdges} to cancel a batch's other already-dispatched calls as soon as one
+   * fails; most callers invoking this directly have no need to pass it.
+   */
   async addEdge(
     tenantId: string,
     graph: string,
     edge: EdgeInput,
+    signal?: AbortSignal,
   ): Promise<void> {
     const request: AddEdgeRequest = {
       tenant_id: tenantId,
@@ -394,13 +448,17 @@ export class RociaDbClient {
       json: encodeJson(edge.value),
       request_id: edge.requestId ?? randomUUID(),
     };
-    await unary("AddEdge", this.#services.graph.addEdge.bind(this.#services.graph), request, await this.#metadata());
+    await unary("AddEdge", this.#services.graph.addEdge.bind(this.#services.graph), request, await this.#metadata(), signal);
   }
 
-  /** Add edges with at most ten in-flight RPCs. The batch is not atomic. */
+  /**
+   * Add edges with at most ten in-flight RPCs. The batch is not atomic: as soon as one
+   * edge fails, every other already-dispatched call in the batch is actively cancelled
+   * (not merely left to finish) rather than only stopping new ones from being scheduled.
+   */
   async addEdges<T>(tenantId: string, graph: string, edges: readonly EdgeInput<T>[]): Promise<void> {
-    await mapConcurrent(edges, CONCURRENT_REQUESTS, async (edge) =>
-      this.addEdge(tenantId, graph, edge),
+    await mapConcurrent(edges, CONCURRENT_REQUESTS, async (edge, _index, signal) =>
+      this.addEdge(tenantId, graph, edge, signal),
     );
   }
 
@@ -516,10 +574,12 @@ export class RociaDbClient {
    * Source chunks may be of any size — the README's `createReadStream()` example emits
    * 64 KiB pieces, for instance — because this method re-buffers them internally and
    * only ever writes exactly {@link UPLOAD_CHUNK_BYTES} (1 MiB) per outgoing message
-   * (the last message carries the remainder). This is required by the server: it stores
-   * one chunk per non-empty message and, on download, reads back
-   * `ceil(size_bytes / 1 MiB)` chunks — a client that emitted smaller messages would
-   * have its downloads silently truncated.
+   * (the last message carries the remainder). The server stores one chunk per
+   * non-empty message and, since `1.0.0-rc.16`, reads a download back by the
+   * recorded `size_bytes`, so this re-buffering is about sending the fewest
+   * possible messages — and about staying safe against a pre-`rc.16` server,
+   * which guessed the chunk count and silently truncated downloads from any
+   * client that emitted smaller messages.
    */
   async uploadFileStream(
     file: FileStreamUpload,
@@ -527,9 +587,49 @@ export class RociaDbClient {
   ): Promise<void> {
     validateFileSize(file.sizeBytes);
     const checksum = requireStreamChecksum(file.checksum);
-    const metadata = await this.#metadata();
     const requestId = file.requestId ?? `upload_file:${randomUUID()}`;
+    await this.#writeUploadStream(
+      await this.#metadata(),
+      buildUploadStreamRequests(file, checksum, requestId, chunks),
+    );
+  }
 
+  /**
+   * Raw streaming upload escape hatch: passes every message through to the gRPC call
+   * exactly as given, with **no re-chunking, no checksum validation, and no distinction
+   * between the first message and the rest**. The caller is fully responsible for the
+   * server's wire contract:
+   * - the first message must carry `tenantId`, `bucket`, `fileId`, `sizeBytes` (the exact
+   *   total byte count) and `checksum` set to the SHA-256 digest of the whole file, as
+   *   exactly 32 raw bytes;
+   * - every message's `chunk` must be at most 1 MiB (1_048_576 bytes); a larger single
+   *   message is rejected with `INVALID_ARGUMENT`;
+   * - `sizeBytes` must equal the exact sum of every chunk sent, or the upload fails with
+   *   `INVALID_ARGUMENT` once the stream ends;
+   * - `tenantId`, `bucket`, `fileId`, `sizeBytes`, `contentType`, and `checksum` on
+   *   messages after the first are ignored by the server and may be left empty.
+   *
+   * Any deviation either fails the upload outright or, worse, silently corrupts a later
+   * download. Only use this if you understand and reproduce that contract yourself; for
+   * the common cases, use {@link uploadFile} (in-memory buffer) or {@link
+   * uploadFileStream} (assisted re-chunking of arbitrarily-sized source chunks) instead.
+   */
+  async uploadFileRaw(
+    requests: AsyncIterable<RawUploadMessage> | Iterable<RawUploadMessage>,
+  ): Promise<void> {
+    await this.#writeUploadStream(await this.#metadata(), buildRawUploadRequests(requests));
+  }
+
+  /**
+   * Drive the file-upload client stream: writes every request from `requests` to the
+   * call, respecting backpressure, and settles once the call completes or fails. Shared
+   * by {@link uploadFileStream} and {@link uploadFileRaw}, which differ only in how they
+   * build the `UploadRequest` sequence.
+   */
+  async #writeUploadStream(
+    metadata: grpc.Metadata,
+    requests: AsyncIterable<UploadRequest> | Iterable<UploadRequest>,
+  ): Promise<void> {
     // `ended` settles exactly once, from whichever of the completion callback or the
     // call's 'error' event fires first (grpc-js can raise both for the same failure).
     // Guarding with `settled` means neither resolve nor reject can ever fire twice.
@@ -561,27 +661,13 @@ export class RociaDbClient {
 
     void (async () => {
       try {
-        const writeChunk = async (chunk: Buffer): Promise<void> => {
-          const request: UploadRequest = {
-            tenant_id: file.tenantId,
-            bucket: file.bucket,
-            file_id: file.fileId,
-            size_bytes: file.sizeBytes.toString(),
-            content_type: file.contentType ?? "application/octet-stream",
-            checksum,
-            chunk,
-            request_id: requestId,
-          };
+        for await (const request of requests) {
+          if (settled) return;
           if (!call.write(request)) {
             // Race backpressure against call completion: if the server ends the call
             // early (e.g. an error), 'drain' may never fire and this must not hang.
             await Promise.race([once(call, "drain"), ended]);
           }
-        };
-
-        for await (const chunk of rechunkToUploadSize(chunks, file.sizeBytes)) {
-          if (settled) return;
-          await writeChunk(chunk);
         }
         call.end();
       } catch (cause) {
@@ -697,9 +783,9 @@ export class RociaDbClient {
       if (page.nextCursor === cursor) break;
       cursor = page.nextCursor;
     } while (cursor);
-    return mapConcurrent(neighbors, CONCURRENT_REQUESTS, async (neighbor) => ({
+    return mapConcurrent(neighbors, CONCURRENT_REQUESTS, async (neighbor, _index, signal) => ({
       ...neighbor,
-      value: await this.getNode<T>(tenantId, graph, neighbor.nodeId),
+      value: await this.getNode<T>(tenantId, graph, neighbor.nodeId, signal),
     }));
   }
 }
@@ -707,7 +793,7 @@ export class RociaDbClient {
 export function pageRequest(page: PageOptions): { limit: number; cursor: string } {
   const limit = page.limit ?? DEFAULT_PAGE_SIZE;
   if (!Number.isInteger(limit) || limit <= 0) {
-    throw new RociaDbError("Page limit must be a positive integer");
+    throw new RociaDbError("Page limit must be a positive integer", { kind: "validation" });
   }
   return { limit, cursor: page.cursor ?? "" };
 }
@@ -739,7 +825,7 @@ export function endpointFromHost(host: string): {
   try {
     url = new URL(hasScheme ? host : `http://${host}`);
   } catch (cause) {
-    throw new RociaDbError("RociaDB host is not a valid URL", { cause });
+    throw new RociaDbError("RociaDB host is not a valid URL", { kind: "connection", cause });
   }
   // WHATWG URL normalizes away a port that matches its scheme's default — e.g.
   // `new URL("https://db.example.com:443").port` is `""`, not `"443"` — even though the
@@ -749,7 +835,9 @@ export function endpointFromHost(host: string): {
   // supplied is filled in the same way, from the scheme's own default.
   const port = url.port || (url.protocol === "https:" ? "443" : url.protocol === "http:" ? "80" : "");
   if (!url.hostname || !port || url.pathname !== "/") {
-    throw new RociaDbError("RociaDB host must contain only a hostname and port");
+    throw new RociaDbError("RociaDB host must contain only a hostname and port", {
+      kind: "connection",
+    });
   }
   return {
     address: `${url.hostname}:${port}`,
@@ -761,11 +849,12 @@ export function endpointFromHost(host: string): {
 
 export function validateFileSize(sizeBytes: bigint): void {
   if (sizeBytes < 0n) {
-    throw new RociaDbError("File size must not be negative");
+    throw new RociaDbError("File size must not be negative", { kind: "validation" });
   }
   if (sizeBytes > BigInt(MAX_FILE_BYTES)) {
     throw new RociaDbError(
       `File size (${sizeBytes} bytes) exceeds the server's default ${MAX_FILE_BYTES}-byte (5 GiB) limit`,
+      { kind: "validation" },
     );
   }
 }
@@ -774,6 +863,7 @@ export function requireChecksumLength(checksum: Uint8Array): Buffer {
   if (checksum.byteLength !== CHECKSUM_BYTES) {
     throw new RociaDbError(
       `File checksum must be exactly ${CHECKSUM_BYTES} bytes (a SHA-256 digest), got ${checksum.byteLength}`,
+      { kind: "validation" },
     );
   }
   return Buffer.from(checksum);
@@ -794,11 +884,12 @@ export function computeOrValidateChecksum(bytes: Uint8Array, checksum?: Uint8Arr
 /**
  * Re-chunk an iterable of arbitrarily-sized byte pieces into messages of exactly
  * {@link UPLOAD_CHUNK_BYTES} (1 MiB) each, except the last message, which carries
- * whatever remains. The server stores one chunk per non-empty message and, on
- * download, reads back exactly `ceil(size_bytes / 1 MiB)` of them, so any other
- * chunking would silently truncate or corrupt the download — this is the pure
- * transformation behind that fix, split out so it can be unit tested without a
- * server or a gRPC call.
+ * whatever remains. 1 MiB is the server's per-message ceiling, so this is the
+ * fewest messages a file can take; it is also the only chunking that stays safe
+ * against a pre-`1.0.0-rc.16` server, which reassembled a download from a
+ * guessed `ceil(size_bytes / 1 MiB)` chunk count and silently truncated anything
+ * sent in smaller pieces. This is the pure transformation, split out so it can
+ * be unit tested without a server or a gRPC call.
  *
  * Validates as it goes: throws before yielding a chunk that would push the running
  * total past `sizeBytes`, and throws once the source is exhausted if the total falls
@@ -821,6 +912,7 @@ export async function* rechunkToUploadSize(
     if (totalWritten > sizeBytes) {
       throw new RociaDbError(
         `uploadFileStream received more data than sizeBytes (${sizeBytes} bytes) declared`,
+        { kind: "validation" },
       );
     }
     wroteAny = true;
@@ -847,6 +939,7 @@ export async function* rechunkToUploadSize(
   if (totalWritten !== sizeBytes) {
     throw new RociaDbError(
       `uploadFileStream sent ${totalWritten} bytes but sizeBytes declared ${sizeBytes}`,
+      { kind: "validation" },
     );
   }
 }
@@ -858,16 +951,97 @@ export function requireStreamChecksum(checksum: Uint8Array | undefined): Buffer 
         "file metadata travels on the first gRPC message, before any chunk has been read " +
         "from the source, so the SDK cannot hash the stream as it goes. Hash the source " +
         "ahead of time, or use uploadFile for data already held in memory.",
+      { kind: "validation" },
     );
   }
   return requireChecksumLength(checksum);
 }
 
-function parseUint64(value: string, field: string): bigint {
+/**
+ * Build the `UploadRequest` message sequence for an assisted, re-chunked upload: only
+ * the first message carries the file's metadata (tenant/bucket/file id, size_bytes,
+ * content_type, checksum, request_id) — the server only reads those fields off the first
+ * message of the stream, so repeating them on every later message would be wasted
+ * bandwidth and CPU and would diverge from what the Rust SDK puts on the wire for the
+ * same upload.
+ *
+ * Pulled out of {@link RociaDbClient.uploadFileStream} as a pure function (no gRPC call,
+ * no I/O) so the exact wire shape it produces can be unit tested directly. `checksum` and
+ * `requestId` are passed in already validated/defaulted by the caller, matching what
+ * `uploadFileStream` computes before opening the network call.
+ */
+export async function* buildUploadStreamRequests(
+  file: FileStreamUpload,
+  checksum: Buffer,
+  requestId: string,
+  chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+): AsyncGenerator<UploadRequest> {
+  let isFirstMessage = true;
+  for await (const chunk of rechunkToUploadSize(chunks, file.sizeBytes)) {
+    yield isFirstMessage
+      ? {
+          tenant_id: file.tenantId,
+          bucket: file.bucket,
+          file_id: file.fileId,
+          size_bytes: file.sizeBytes.toString(),
+          content_type: file.contentType ?? "application/octet-stream",
+          checksum,
+          chunk,
+          request_id: requestId,
+        }
+      : {
+          tenant_id: "",
+          bucket: "",
+          file_id: "",
+          size_bytes: "0",
+          content_type: "",
+          checksum: Buffer.alloc(0),
+          chunk,
+          request_id: "",
+        };
+    isFirstMessage = false;
+  }
+}
+
+/**
+ * Convert each {@link RawUploadMessage} into the wire `UploadRequest` shape unchanged —
+ * no re-chunking, no validation, and no first-message/later-message distinction; every
+ * field travels exactly as the caller supplied it, for every message.
+ *
+ * Pulled out of {@link RociaDbClient.uploadFileRaw} as a pure function (no gRPC call, no
+ * I/O) so the passthrough behavior can be unit tested directly.
+ */
+export async function* buildRawUploadRequests(
+  requests: AsyncIterable<RawUploadMessage> | Iterable<RawUploadMessage>,
+): AsyncGenerator<UploadRequest> {
+  for await (const message of requests) {
+    yield {
+      tenant_id: message.tenantId,
+      bucket: message.bucket,
+      file_id: message.fileId,
+      size_bytes: message.sizeBytes.toString(),
+      content_type: message.contentType,
+      checksum: Buffer.from(message.checksum),
+      chunk: Buffer.from(message.chunk),
+      request_id: message.requestId,
+    };
+  }
+}
+
+/**
+ * Parses a wire-format protobuf `uint64` (transmitted as a decimal string, see
+ * `longs: String` in {@link createServiceClients}) into a `bigint`, preserving the full
+ * uint64 range. `kind: "decode"` because this is decoding a value out of a response
+ * received from upstream, the same bucket as {@link decodeJson}.
+ *
+ * Exported for unit testing (no gRPC response is needed to exercise the decode-failure
+ * branch); used internally by every response reader that carries a wire uint64.
+ */
+export function parseUint64(value: string, field: string): bigint {
   try {
     return BigInt(value);
   } catch (cause) {
-    throw new RociaDbError(`Invalid protobuf uint64 value for ${field}`, { cause });
+    throw new RociaDbError(`Invalid protobuf uint64 value for ${field}`, { kind: "decode", cause });
   }
 }
 
@@ -878,6 +1052,7 @@ function credentialsFromEnvironment(): ClientCredentials {
   if (!tokenUrl || !clientId || !clientSecret) {
     throw new RociaDbError(
       "Missing auth configuration (set AUTH_TOKEN_URL, AUTH_CLIENT_ID, and AUTH_CLIENT_SECRET)",
+      { kind: "connection" },
     );
   }
   return { tokenUrl, clientId, clientSecret };
