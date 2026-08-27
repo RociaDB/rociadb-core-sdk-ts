@@ -1,0 +1,318 @@
+syntax = "proto3";
+
+package rocia.v1;
+
+import "google/protobuf/empty.proto";
+
+message PageRequest {
+  uint32 limit = 1;
+  string cursor = 2;
+}
+
+message PageResponse {
+  string next_cursor = 1;
+}
+
+message PutDocRequest {
+  string tenant_id = 1;
+  string collection = 2;
+  string id = 3;
+  bytes json = 4;
+  string request_id = 5;
+}
+
+message GetDocRequest {
+  string tenant_id = 1;
+  string collection = 2;
+  string id = 3;
+}
+
+message GetDocResponse {
+  bytes json = 1;
+}
+
+message DeleteDocRequest {
+  string tenant_id = 1;
+  string collection = 2;
+  string id = 3;
+  string request_id = 4;
+}
+
+message FindByFieldRequest {
+  string tenant_id = 1;
+  string collection = 2;
+  string field = 3;
+  bytes value_json = 4;
+  PageRequest page = 5;
+}
+
+message ListDocRequest {
+  string tenant_id = 1;
+  string collection = 2;
+  PageRequest page = 3;
+}
+
+enum QueryOperator {
+  QUERY_OPERATOR_UNSPECIFIED = 0;
+  QUERY_OPERATOR_EQ = 1;
+  QUERY_OPERATOR_IN = 2;
+  QUERY_OPERATOR_CONTAINS = 3;
+}
+
+enum SortDirection {
+  SORT_DIRECTION_UNSPECIFIED = 0;
+  SORT_DIRECTION_ASC = 1;
+  SORT_DIRECTION_DESC = 2;
+}
+
+message QueryFilter {
+  string field = 1;
+  QueryOperator operator = 2;
+  repeated bytes values_json = 3;
+}
+
+message QuerySort {
+  string field = 1;
+  SortDirection direction = 2;
+}
+
+message QueryDocRequest {
+  string tenant_id = 1;
+  string collection = 2;
+  repeated QueryFilter filters = 3;
+  repeated QuerySort sort = 4;
+  PageRequest page = 5;
+}
+
+message FindByFieldResponse {
+  repeated bytes json = 1;
+  PageResponse page = 2;
+  uint64 total_count = 3;
+}
+
+message ListDocResponse {
+  repeated bytes json = 1;
+  PageResponse page = 2;
+  uint64 total_count = 3;
+}
+
+message ListCollectionsRequest {
+  string tenant_id = 1;
+  PageRequest page = 2;
+}
+
+message CollectionInfo {
+  string collection = 1;
+  uint64 count = 2;
+}
+
+message ListCollectionsResponse {
+  repeated CollectionInfo collections = 1;
+  PageResponse page = 2;
+}
+
+message ListBucketsRequest {
+  string tenant_id = 1;
+  PageRequest page = 2;
+}
+
+message ListBucketsResponse {
+  repeated string buckets = 1;
+  PageResponse page = 2;
+}
+
+message ListFilesRequest {
+  string tenant_id = 1;
+  string bucket = 2;
+  PageRequest page = 3;
+}
+
+message ListFilesResponse {
+  repeated string file_ids = 1;
+  PageResponse page = 2;
+}
+
+message ListGraphsRequest {
+  string tenant_id = 1;
+  PageRequest page = 2;
+}
+
+message ListGraphsResponse {
+  repeated string graphs = 1;
+  PageResponse page = 2;
+}
+
+message ListNodesRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  PageRequest page = 3;
+}
+
+message ListNodesResponse {
+  repeated string node_ids = 1;
+  PageResponse page = 2;
+}
+
+message ListTenantsRequest {
+  PageRequest page = 1;
+}
+
+message ListTenantsResponse {
+  repeated string tenant_ids = 1;
+  PageResponse page = 2;
+}
+
+message QueryDocResponse {
+  repeated bytes json = 1;
+  PageResponse page = 2;
+  uint64 total_count = 3;
+}
+
+message PutNodeRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  string node_id = 3;
+  bytes json = 4;
+  string request_id = 5;
+}
+
+message GetNodeRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  string node_id = 3;
+}
+
+message GetNodeResponse {
+  bytes json = 1;
+}
+
+message AddEdgeRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  string edge_id = 3;
+  string from = 4;
+  string to = 5;
+  string label = 6;
+  bytes json = 7;
+  string request_id = 8;
+}
+
+message DeleteEdgeRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  string edge_id = 3;
+  string request_id = 4;
+}
+
+message NeighborsOutRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  string from = 3;
+  string label = 4;
+  PageRequest page = 5;
+}
+
+message Neighbor {
+  string node_id = 1;
+  string edge_id = 2;
+}
+
+message NeighborsOutResponse {
+  repeated Neighbor neighbors = 1;
+  PageResponse page = 2;
+}
+
+message NeighborsInRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  string to = 3;
+  string label = 4;
+  PageRequest page = 5;
+}
+
+message NeighborsInResponse {
+  repeated Neighbor neighbors = 1;
+  PageResponse page = 2;
+}
+
+message UploadRequest {
+  string tenant_id = 1;
+  string bucket = 2;
+  string file_id = 3;
+  uint64 size_bytes = 4;
+  string content_type = 5;
+  bytes checksum = 6;
+  bytes chunk = 7;
+  string request_id = 8;
+}
+
+message DownloadRequest {
+  string tenant_id = 1;
+  string bucket = 2;
+  string file_id = 3;
+}
+
+message DownloadResponse {
+  bytes chunk = 1;
+}
+
+message StatRequest {
+  string tenant_id = 1;
+  string bucket = 2;
+  string file_id = 3;
+}
+
+message StatResponse {
+  uint64 size_bytes = 1;
+  string content_type = 2;
+  bytes checksum = 3;
+  string created_at = 4;
+  string updated_at = 5;
+}
+
+message DeleteRequest {
+  string tenant_id = 1;
+  string bucket = 2;
+  string file_id = 3;
+  string request_id = 4;
+}
+
+service DocumentService {
+  rpc PutDoc(PutDocRequest) returns (google.protobuf.Empty);
+  rpc GetDoc(GetDocRequest) returns (GetDocResponse);
+  rpc DeleteDoc(DeleteDocRequest) returns (google.protobuf.Empty);
+  rpc FindByField(FindByFieldRequest) returns (FindByFieldResponse);
+  rpc ListDoc(ListDocRequest) returns (ListDocResponse);
+  rpc QueryDoc(QueryDocRequest) returns (QueryDocResponse);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+}
+
+service GraphService {
+  rpc PutNode(PutNodeRequest) returns (google.protobuf.Empty);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc AddEdge(AddEdgeRequest) returns (google.protobuf.Empty);
+  rpc DeleteEdge(DeleteEdgeRequest) returns (google.protobuf.Empty);
+  rpc NeighborsOut(NeighborsOutRequest) returns (NeighborsOutResponse);
+  rpc NeighborsIn(NeighborsInRequest) returns (NeighborsInResponse);
+  rpc ListGraphs(ListGraphsRequest) returns (ListGraphsResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+
+service FileService {
+  rpc Upload(stream UploadRequest) returns (google.protobuf.Empty);
+  rpc Download(DownloadRequest) returns (stream DownloadResponse);
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc Delete(DeleteRequest) returns (google.protobuf.Empty);
+  rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+}
+
+// Opérations transverses aux tenants.
+//
+// Séparé des trois services de modèle parce que rien ici n'est scopé à un
+// tenant : ListTenants énumère l'ensemble du déploiement. Ce découpage permet
+// de lui appliquer une politique d'autorisation propre le jour où il en faudra
+// une, sans toucher aux services de données.
+service TenantService {
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+}

@@ -1,0 +1,26 @@
+[tools]
+node = "24.16.0"
+
+[tasks.install]
+description = "Install exact dependencies from package-lock.json"
+run = "npm ci"
+
+[tasks.typecheck]
+description = "Check strict TypeScript types"
+run = "npm run typecheck"
+
+[tasks.build]
+description = "Compile the SDK and declaration files"
+run = "npm run build"
+
+[tasks.test]
+description = "Build and run the unit tests"
+run = "npm test"
+
+[tasks.pack]
+description = "Inspect the npm package without publishing it"
+run = "npm pack --dry-run"
+
+[tasks.check]
+description = "Run all checks required before publication"
+depends = ["typecheck", "test", "pack"]
