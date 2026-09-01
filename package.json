@@ -1,5 +1,5 @@
 {
-  "name": "@rocia/core-sdk",
+  "name": "@rocia/rociadb-sdk",
   "version": "1.0.0",
   "description": "TypeScript client SDK for RociaDB document, graph, and file gRPC services",
   "author": "RociaDB SAS",
