@@ -1,8 +1,17 @@
 {
-  "name": "rocia-db-sdk",
+  "name": "@rociadb/core-sdk",
   "version": "0.6.0",
   "description": "TypeScript client SDK for RociaDB document, graph, and file gRPC services",
+  "author": "RociaDB SAS",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RociaDB/rociadb-core-sdk-ts.git"
+  },
+  "homepage": "https://github.com/RociaDB/rociadb-core-sdk-ts#readme",
+  "bugs": {
+    "url": "https://github.com/RociaDB/rociadb-core-sdk-ts/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -20,6 +29,8 @@
   "files": [
     "dist",
     "!dist/test",
+    "src",
+    "!src/test",
     "proto",
     "README.md",
     "LICENSE"

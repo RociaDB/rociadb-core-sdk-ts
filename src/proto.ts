@@ -4,7 +4,7 @@
  * This module is **not** part of the package's semver contract: it is a thin reflection
  * of `proto/upstream/v1/upstream.proto` and can be reshaped by a routine
  * `@grpc/proto-loader` upgrade without the rest of the SDK's own API changing. It is
- * exported under the `rocia-db-sdk/proto` subpath so a caller who needs to build a custom
+ * exported under the `@rociadb/core-sdk/proto` subpath so a caller who needs to build a custom
  * gRPC client (bypassing {@link RociaDbClient}) can do so without duplicating the
  * `.proto` loading logic — depend on it only if you accept that its shapes can change
  * between any two versions of this package.

@@ -47,7 +47,7 @@ test("package.json exposes the raw generated protobuf types under a \"./proto\" 
 
 test("the \"./proto\" subpath export's build outputs actually exist after `npm run build`", async () => {
   // A dangling exports entry that points at files the build never produces would break
-  // for every consumer of `rocia-db-sdk/proto`; this fails loudly instead.
+  // for every consumer of `@rociadb/core-sdk/proto`; this fails loudly instead.
   await assert.doesNotReject(readFile(join(packageRoot, "dist", "proto.js"), "utf8"));
   await assert.doesNotReject(readFile(join(packageRoot, "dist", "proto.d.ts"), "utf8"));
 });

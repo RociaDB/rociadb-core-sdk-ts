@@ -52,18 +52,21 @@ authorization is the calling application's responsibility; see
 - OAuth2 client credentials unless authentication is explicitly disabled
 
 ```bash
-npm install rocia-db-sdk
+npm install @rociadb/core-sdk
 ```
 
 The SDK uses `@grpc/grpc-js` and is designed for Node.js services, workers, and
 CLI applications. It does not run directly in a browser.
+
+A complete project wired against this SDK is available as a starting point:
+[`example-ts-project`](https://github.com/RociaDB/example-ts-project).
 
 ## Connecting
 
 Use the builder when you want fluent configuration:
 
 ```ts
-import { RociaDbBuilder } from "rocia-db-sdk";
+import { RociaDbBuilder } from "@rociadb/core-sdk";
 
 const client = await new RociaDbBuilder()
   .host("https://db.example.com:443")
@@ -176,7 +179,7 @@ These two statuses look similar but call for opposite handling:
 
 ```ts
 import { status } from "@grpc/grpc-js";
-import { RociaDbError } from "rocia-db-sdk";
+import { RociaDbError } from "@rociadb/core-sdk";
 
 try {
   await client.getDocument("tenant-1", "products", "sku-123");
@@ -234,7 +237,7 @@ callers who need OAuth2 token handling outside of a `RociaDbClient` — for
 example, to reuse the same access token against a different service:
 
 ```ts
-import { TokenManager, fetchOAuthToken } from "rocia-db-sdk";
+import { TokenManager, fetchOAuthToken } from "@rociadb/core-sdk";
 
 // One-off token exchange, no caching or refresh:
 const token = await fetchOAuthToken({
@@ -681,7 +684,7 @@ responsible for the wire contract described in
 
 ```ts
 import { createHash, randomUUID } from "node:crypto";
-import type { RawUploadMessage } from "rocia-db-sdk";
+import type { RawUploadMessage } from "@rociadb/core-sdk";
 
 async function* rawUpload(): AsyncGenerator<RawUploadMessage> {
   const payload = Buffer.from("hello RociaDB");
@@ -796,7 +799,7 @@ on `code`/`reason` for gRPC-specific branching:
 
 ```ts
 import { status } from "@grpc/grpc-js";
-import { RociaDbError } from "rocia-db-sdk";
+import { RociaDbError } from "@rociadb/core-sdk";
 
 try {
   await client.getDocument("tenant-1", "products", "missing");
@@ -827,20 +830,20 @@ and invalid pagination arguments or file sizes/checksums (`kind:
 
 ## Advanced: Raw Protobuf Access
 
-`rocia-db-sdk/proto` exports the generated request/response shapes and gRPC
+`@rociadb/core-sdk/proto` exports the generated request/response shapes and gRPC
 service-client interfaces backing every `RociaDbClient` method, for callers
 who need to build a custom gRPC client against the same `.proto` file
 instead of going through `RociaDbClient`:
 
 ```ts
-import { createServiceClients } from "rocia-db-sdk/proto";
+import { createServiceClients } from "@rociadb/core-sdk/proto";
 ```
 
 This module mirrors the Rust SDK's `#[doc(hidden)] pub mod pb` — it is
 **not** part of this package's semver contract. A routine
 `@grpc/proto-loader` upgrade can reshape it without the rest of the SDK's
 own API changing at all. Depend on it only if you accept that its shapes can
-change between any two versions of `rocia-db-sdk`.
+change between any two versions of `@rociadb/core-sdk`.
 
 ## API Coverage
 
@@ -872,7 +875,7 @@ change between any two versions of `rocia-db-sdk`.
 ## Parity with the Rust SDK
 
 This SDK and the Rust SDK
-([`rociadb-core-sdk-rust`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust))
+([`rociadb-core-sdk-rust`](https://github.com/RociaDB/rociadb-core-sdk-rust))
 cover the same 22 RPCs against the same server, and are maintained to the
 same standard: **every capability available in one is available in the
 other.** Neither imitates the other's syntax — this package stays
@@ -886,7 +889,7 @@ so on). The handful of places where a name does **not** translate
 mechanically — where translating a call by ear lands you on the wrong
 method — are the naming table below.
 
-| Capability | TypeScript (this SDK) | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDBSebastienS/rociadb-core-sdk-rust)) | Note |
+| Capability | TypeScript (this SDK) | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDB/rociadb-core-sdk-rust)) | Note |
 |---|---|---|---|
 | Assisted streaming upload — re-chunks to the 1 MiB wire contract, validates the total, caller supplies the checksum | `uploadFileStream` | `upload_file_chunked` | Names do **not** correspond — see the naming trap below. |
 | Raw streaming upload — zero validation, caller builds every protobuf message | `uploadFileRaw` | `upload_file_stream` | Names do **not** correspond — the mirror image of the row above. |
@@ -895,7 +898,7 @@ method — are the naming table below.
 | Lazy token invalidation at the level of the token-caching type itself (not the client-level wrapper, which *does* translate mechanically: `invalidateToken` ↔ `invalidate_auth_token`) | `TokenManager.invalidate()` | `TokenManager::request_refresh` | Different verb chosen independently on each side for the same "mark it stale, refresh on next use" idea. |
 | Standalone OAuth2 token fetch, usable outside of `TokenManager` | `fetchOAuthToken` (exported from `auth.ts`, re-exported at the package root) | `auth::fetch_token` | TypeScript needed a name that does not collide with the `fetch` Web API it wraps; Rust has no such collision. |
 | Discriminating why an error happened | `RociaDbError.kind: RociaDbErrorKind`, one class with a `"status" \| "connection" \| "auth" \| "encode" \| "decode" \| "validation"` field | `RociaDbError` — a `match`-able enum: `Status { .. }` / `Connection { .. }` / `Auth { .. }` / `Encode { .. }` / `Decode { .. }` / `Validation(String)` | Different shape, not just a different name — see below. |
-| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | the `rocia-db-sdk/proto` subpath export (see [Advanced: Raw Protobuf Access](#advanced-raw-protobuf-access)) | the `pb` module (`#[doc(hidden)] pub mod pb`; the handful of generated types that reach a public signature are re-exported individually at the crate root instead) | Different mechanism, not just a different name: a separate `package.json` `exports` entry vs. an in-crate module. Neither is part of either package's semver contract. |
+| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | the `@rociadb/core-sdk/proto` subpath export (see [Advanced: Raw Protobuf Access](#advanced-raw-protobuf-access)) | the `pb` module (`#[doc(hidden)] pub mod pb`; the handful of generated types that reach a public signature are re-exported individually at the crate root instead) | Different mechanism, not just a different name: a separate `package.json` `exports` entry vs. an in-crate module. Neither is part of either package's semver contract. |
 
 **The upload naming trap, spelled out:** `uploadFileStream` (TypeScript) and
 `upload_file_chunked` (Rust) are the *same* capability — the middle tier
@@ -954,4 +957,4 @@ Without mise, run `npm ci`, `npm run typecheck`, `npm test`, and
 `npm pack --dry-run`. Before publishing, confirm that the package name is
 available and that the npm account has permission to publish it.
 
-Licensed under Apache-2.0.
+Copyright 2026 RociaDB SAS. Licensed under Apache-2.0.
